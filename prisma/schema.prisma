@@ -1,0 +1,62 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id           String      @id @default(cuid())
+  email        String      @unique
+  passwordHash String
+  name         String?
+  createdAt    DateTime    @default(now())
+  plaidItems   PlaidItem[]
+}
+
+model PlaidItem {
+  id                   String    @id @default(cuid())
+  userId               String
+  user                 User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plaidItemId          String    @unique
+  encryptedAccessToken String
+  institutionName      String?
+  syncCursor           String?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+  accounts             Account[]
+}
+
+model Account {
+  id               String        @id @default(cuid())
+  plaidItemId      String
+  item             PlaidItem     @relation(fields: [plaidItemId], references: [id], onDelete: Cascade)
+  plaidAccountId   String        @unique
+  name             String
+  officialName     String?
+  type             String
+  subtype          String?
+  mask             String?
+  currentBalance   Decimal       @db.Decimal(18, 2)
+  availableBalance Decimal?      @db.Decimal(18, 2)
+  isoCurrencyCode  String        @default("USD")
+  transactions     Transaction[]
+}
+
+model Transaction {
+  id                 String   @id @default(cuid())
+  accountId          String
+  account            Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  plaidTransactionId String   @unique
+  amount             Decimal  @db.Decimal(18, 2)
+  date               DateTime @db.Date
+  name               String
+  merchantName       String?
+  category           String?
+  pending            Boolean  @default(false)
+  isoCurrencyCode    String   @default("USD")
+
+  @@index([accountId, date])
+}
