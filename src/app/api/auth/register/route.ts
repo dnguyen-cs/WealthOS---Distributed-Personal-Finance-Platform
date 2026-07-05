@@ -1,0 +1,42 @@
+import { NextResponse } from 'next/server';
+import bcrypt from 'bcryptjs';
+import { z } from 'zod';
+import { prisma } from '@/lib/db/prisma';
+
+const bodySchema = z.object({
+  email: z.email(),
+  // bcrypt truncates input beyond 72 bytes
+  password: z.string().min(8).max(72),
+  name: z.string().trim().min(1).max(100).optional(),
+});
+
+export async function POST(request: Request) {
+  const json = await request.json().catch(() => null);
+  const parsed = bodySchema.safeParse(json);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: 'Enter a valid email and a password of at least 8 characters.' },
+      { status: 400 },
+    );
+  }
+
+  const email = parsed.data.email.toLowerCase();
+  const passwordHash = await bcrypt.hash(parsed.data.password, 12);
+
+  try {
+    const user = await prisma.user.create({
+      data: { email, passwordHash, name: parsed.data.name },
+    });
+    return NextResponse.json({ id: user.id, email: user.email }, { status: 201 });
+  } catch (error) {
+    // unique constraint on email
+    if (
+      error instanceof Error &&
+      'code' in error &&
+      (error as { code?: string }).code === 'P2002'
+    ) {
+      return NextResponse.json({ error: 'Email is already registered.' }, { status: 409 });
+    }
+    throw error;
+  }
+}
