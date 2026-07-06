@@ -2,6 +2,16 @@ export function formatCurrency(amount: number, currency = 'USD'): string {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency }).format(amount);
 }
 
+// Axis ticks and stat tiles: $1.2M instead of $1,200,000.00
+export function formatCurrencyCompact(amount: number, currency = 'USD'): string {
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency,
+    notation: 'compact',
+    maximumFractionDigits: 1,
+  }).format(amount);
+}
+
 // Plaid @db.Date values come back as UTC midnight; format in UTC to avoid day shift
 export function formatDate(date: Date): string {
   return new Intl.DateTimeFormat('en-US', {

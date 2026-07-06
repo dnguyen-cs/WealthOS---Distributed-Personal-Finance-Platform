@@ -1,14 +1,13 @@
+import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { auth } from '@/lib/auth';
 import { prisma } from '@/lib/db/prisma';
 import { formatCurrency } from '@/lib/format';
+import { computeNetWorth } from '@/lib/networth';
 import { AccountList, type BankItem } from '@/components/portfolio/AccountList';
 import { PlaidLinkButton } from '@/components/portfolio/PlaidLinkButton';
 import { TransactionTable, type TransactionRow } from '@/components/portfolio/TransactionTable';
 import { SignOutButton } from '@/components/ui/SignOutButton';
-
-// account types where the balance is money owed rather than money held
-const LIABILITY_TYPES = new Set(['credit', 'loan']);
 
 export default async function DashboardPage() {
   const session = await auth();
@@ -54,15 +53,7 @@ export default async function DashboardPage() {
     accountName: t.account.name,
   }));
 
-  const netWorth = items
-    .flatMap((item) => item.accounts)
-    .reduce(
-      (sum, account) =>
-        LIABILITY_TYPES.has(account.type)
-          ? sum - account.currentBalance
-          : sum + account.currentBalance,
-      0,
-    );
+  const netWorth = computeNetWorth(items.flatMap((item) => item.accounts));
 
   const hasBanks = items.length > 0;
 
@@ -73,7 +64,15 @@ export default async function DashboardPage() {
           <h1 className="text-2xl font-semibold tracking-tight">Dashboard</h1>
           <p className="text-sm opacity-60">{session.user.email}</p>
         </div>
-        <SignOutButton />
+        <div className="flex items-center gap-4">
+          <Link
+            href="/dashboard/simulations"
+            className="text-sm underline underline-offset-4 opacity-80 hover:opacity-100"
+          >
+            Simulations
+          </Link>
+          <SignOutButton />
+        </div>
       </header>
 
       {hasBanks ? (
