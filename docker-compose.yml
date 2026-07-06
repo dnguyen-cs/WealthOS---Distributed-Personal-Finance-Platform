@@ -26,6 +26,32 @@ services:
       timeout: 3s
       retries: 10
 
+  # Local SQS stand-in (dev-only emulator; AWS provides the real queue)
+  queue:
+    image: softwaremill/elasticmq-native:latest
+    ports:
+      - "9324:9324"
+    volumes:
+      - ./docker/elasticmq.conf:/opt/elasticmq.conf:ro
+
+  # Local S3 stand-in (dev-only emulator; AWS provides the real bucket)
+  objectstore:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - objectstore-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   app:
     build:
       context: .
@@ -37,6 +63,9 @@ services:
       # override localhost from .env with in-network service hosts
       DATABASE_URL: postgresql://wealthos:wealthos@db:5432/wealthos
       REDIS_URL: redis://redis:6379
+      SQS_ENDPOINT: http://queue:9324
+      WEALTHSIM_QUEUE_URL: http://queue:9324/000000000000/wealthsim-jobs
+      S3_ENDPOINT: http://objectstore:9000
     depends_on:
       db:
         condition: service_healthy
@@ -47,5 +76,22 @@ services:
       - /app/node_modules
       - /app/.next
 
+  # WealthSim compute worker; scale with: docker compose up -d --scale worker=4 worker
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    env_file: .env
+    environment:
+      SQS_ENDPOINT: http://queue:9324
+      WEALTHSIM_QUEUE_URL: http://queue:9324/000000000000/wealthsim-jobs
+      S3_ENDPOINT: http://objectstore:9000
+    depends_on:
+      queue:
+        condition: service_started
+      objectstore:
+        condition: service_healthy
+
 volumes:
   db-data:
+  objectstore-data:
