@@ -8,12 +8,13 @@ datasource db {
 }
 
 model User {
-  id           String      @id @default(cuid())
-  email        String      @unique
-  passwordHash String
-  name         String?
-  createdAt    DateTime    @default(now())
-  plaidItems   PlaidItem[]
+  id             String          @id @default(cuid())
+  email          String          @unique
+  passwordHash   String
+  name           String?
+  createdAt      DateTime        @default(now())
+  plaidItems     PlaidItem[]
+  simulationJobs SimulationJob[]
 }
 
 model PlaidItem {
@@ -59,4 +60,43 @@ model Transaction {
   isoCurrencyCode    String   @default("USD")
 
   @@index([accountId, date])
+}
+
+enum SimulationJobStatus {
+  queued
+  running
+  completed
+  failed
+}
+
+// Chunk-level results are not stored here: workers write per-chunk
+// summaries to object storage, and only the final aggregate lands in
+// Postgres. Workers therefore need no database access at all.
+model SimulationJob {
+  id          String              @id @default(cuid())
+  userId      String
+  user        User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status      SimulationJobStatus @default(queued)
+  params      Json
+  pathCount   Int
+  chunkCount  Int
+  chunkSize   Int
+  seed        Int
+  error       String?
+  createdAt   DateTime            @default(now())
+  completedAt DateTime?
+  result      SimulationResult?
+
+  @@index([userId, createdAt])
+}
+
+model SimulationResult {
+  id             String        @id @default(cuid())
+  jobId          String        @unique
+  job            SimulationJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  yearlyStats    Json
+  pathsCompleted Int
+  totalComputeMs Int
+  wallMs         Int
+  createdAt      DateTime      @default(now())
 }
