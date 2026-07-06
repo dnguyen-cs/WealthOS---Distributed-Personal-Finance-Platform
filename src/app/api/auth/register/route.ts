@@ -5,7 +5,6 @@ import { prisma } from '@/lib/db/prisma';
 
 const bodySchema = z.object({
   email: z.email(),
-  // bcrypt truncates input beyond 72 bytes
   password: z.string().min(8).max(72),
   name: z.string().trim().min(1).max(100).optional(),
 });
@@ -29,7 +28,6 @@ export async function POST(request: Request) {
     });
     return NextResponse.json({ id: user.id, email: user.email }, { status: 201 });
   } catch (error) {
-    // unique constraint on email
     if (
       error instanceof Error &&
       'code' in error &&
