@@ -30,6 +30,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@aws-sdk/client-batch": "^3.1080.0",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
     "@types/react": "^19",
