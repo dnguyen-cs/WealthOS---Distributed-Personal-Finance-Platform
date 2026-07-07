@@ -92,7 +92,8 @@ resource "aws_batch_compute_environment" "wealthsim" {
   service_role = aws_iam_role.batch_service.arn
 
   compute_resources {
-    type               = "FARGATE"
+    type = "FARGATE"
+    # matches the account's approved Fargate on-demand vCPU quota
     max_vcpus          = 64
     security_group_ids = [aws_security_group.wealthsim_worker.id]
     subnets            = aws_subnet.public[*].id
@@ -135,7 +136,11 @@ resource "aws_batch_job_definition" "wealthsim_worker" {
       { name = "WEALTHSIM_QUEUE_URL", value = aws_sqs_queue.wealthsim_jobs.url },
       { name = "WEALTHSIM_BUCKET", value = aws_s3_bucket.wealthsim_results.bucket },
       { name = "AWS_REGION", value = "us-east-1" },
-      { name = "WORKER_IDLE_EXIT_SECONDS", value = "60" },
+      # MUST exceed the queue's 300s visibility timeout: if a worker dies
+      # with a chunk in flight, the survivors have to still be alive when
+      # SQS redelivers it, or the fleet self-terminates with work stranded
+      # invisible in the queue (found by the AWS chaos test 2026-07-07)
+      { name = "WORKER_IDLE_EXIT_SECONDS", value = "360" },
     ]
 
     logConfiguration = {

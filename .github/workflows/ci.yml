@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  app:
+    runs-on: ubuntu-latest
+    env:
+      # build-time placeholders; nothing connects during lint/typecheck/build
+      DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+      REDIS_URL: redis://localhost:6379
+      AUTH_SECRET: ci-placeholder-secret
+      PLAID_CLIENT_ID: ci
+      PLAID_SECRET: ci
+      PLAID_ENV: sandbox
+      PLAID_TOKEN_ENC_KEY: '0000000000000000000000000000000000000000000000000000000000000000'
+      AWS_REGION: us-east-1
+      WEALTHSIM_QUEUE_URL: http://localhost:9324/000000000000/wealthsim-jobs
+      WEALTHSIM_BUCKET: ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm prisma generate
+      - run: pnpm lint
+      - run: pnpm exec tsc --noEmit
+      - run: pnpm build
+      # the vitest suite is intentionally not in version control, so CI
+      # covers lint/types/build; tests run locally via `pnpm test`
+
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform fmt -check
+      - run: terraform init -backend=false
+      - run: terraform validate
