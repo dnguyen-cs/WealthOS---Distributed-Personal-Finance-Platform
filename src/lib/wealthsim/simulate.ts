@@ -24,7 +24,8 @@ interface YearAccumulator {
 }
 
 export function simulateChunk(spec: ChunkSpec): Omit<ChunkSummary, 'computeMs' | 'workerId'> {
-  const { initialValue, annualContribution, meanReturn, volatility, years } = spec.params;
+  const { initialValue, annualContribution, meanReturn, volatility, years, antithetic } =
+    spec.params;
   const dt = 1 / STEPS_PER_YEAR;
   const drift = (meanReturn - 0.5 * volatility * volatility) * dt;
   const diffusion = volatility * Math.sqrt(dt);
@@ -40,20 +41,57 @@ export function simulateChunk(spec: ChunkSpec): Omit<ChunkSummary, 'computeMs' |
     histogram: new LogHistogram(config),
   }));
 
+  const record = (year: number, value: number) => {
+    const acc = accumulators[year];
+    acc.count++;
+    acc.sum += value;
+    acc.sumSq += value * value;
+    if (value < acc.min) acc.min = value;
+    if (value > acc.max) acc.max = value;
+    acc.histogram.record(value);
+  };
+
   const rng = new RandomSource(spec.seed);
-  for (let path = 0; path < spec.pathCount; path++) {
-    let value = initialValue;
-    for (let year = 0; year < years; year++) {
-      for (let step = 0; step < STEPS_PER_YEAR; step++) {
-        value = value * Math.exp(drift + diffusion * rng.nextNormal()) + monthlyContribution;
+
+  if (antithetic) {
+    // Antithetic variates: each draw drives a +Z path and a -Z twin. The
+    // marginal distribution of each path is unchanged (Z and -Z are
+    // identically distributed), but the pair's average has sharply lower
+    // variance because GBM terminal wealth is monotone in the summed
+    // shocks, making the twins strongly negatively correlated. An odd
+    // final path falls back to independent sampling.
+    const pairCount = Math.floor(spec.pathCount / 2);
+    for (let pair = 0; pair < pairCount; pair++) {
+      let plus = initialValue;
+      let minus = initialValue;
+      for (let year = 0; year < years; year++) {
+        for (let step = 0; step < STEPS_PER_YEAR; step++) {
+          const shock = diffusion * rng.nextNormal();
+          plus = plus * Math.exp(drift + shock) + monthlyContribution;
+          minus = minus * Math.exp(drift - shock) + monthlyContribution;
+        }
+        record(year, plus);
+        record(year, minus);
       }
-      const acc = accumulators[year];
-      acc.count++;
-      acc.sum += value;
-      acc.sumSq += value * value;
-      if (value < acc.min) acc.min = value;
-      if (value > acc.max) acc.max = value;
-      acc.histogram.record(value);
+    }
+    if (spec.pathCount % 2 === 1) {
+      let value = initialValue;
+      for (let year = 0; year < years; year++) {
+        for (let step = 0; step < STEPS_PER_YEAR; step++) {
+          value = value * Math.exp(drift + diffusion * rng.nextNormal()) + monthlyContribution;
+        }
+        record(year, value);
+      }
+    }
+  } else {
+    for (let path = 0; path < spec.pathCount; path++) {
+      let value = initialValue;
+      for (let year = 0; year < years; year++) {
+        for (let step = 0; step < STEPS_PER_YEAR; step++) {
+          value = value * Math.exp(drift + diffusion * rng.nextNormal()) + monthlyContribution;
+        }
+        record(year, value);
+      }
     }
   }
 

@@ -21,6 +21,7 @@ const params: ModelParams = {
   meanReturn: 0.07,
   volatility: 0.15,
   years: 30,
+  antithetic: true,
 };
 
 const stepsPerPath = params.years * STEPS_PER_YEAR;

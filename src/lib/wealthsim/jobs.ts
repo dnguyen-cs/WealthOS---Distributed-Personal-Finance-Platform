@@ -67,10 +67,10 @@ export async function createSimulationJob(
   userId: string,
   request: SimulationRequest,
 ): Promise<SimulationJob> {
-  const { pathCount, ...params } = request;
+  const { pathCount, seed: requestedSeed, ...params } = request;
   // Postgres int4 caps at 2^31 - 1; the seed is remixed through
   // splitmix32 anyway, so 31 bits of entropy is as good as 32 here.
-  const seed = randomInt(0, 2 ** 31);
+  const seed = requestedSeed ?? randomInt(0, 2 ** 31);
   const chunkSize = DEFAULT_CHUNK_SIZE;
   const chunkCount = Math.ceil(pathCount / chunkSize);
 

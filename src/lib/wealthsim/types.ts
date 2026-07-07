@@ -10,6 +10,11 @@ export const modelParamsSchema = z.object({
   meanReturn: z.number().min(-0.5).max(0.5),
   volatility: z.number().min(0).max(1),
   years: z.number().int().min(1).max(60),
+  // Antithetic variates: paths are generated in +Z/-Z pairs, which leaves
+  // every marginal distribution unchanged but sharply reduces the
+  // variance of mean-type estimators at the same path count. Defaulted on;
+  // the toggle exists so benchmarks can quantify the reduction.
+  antithetic: z.boolean().default(true),
 });
 
 export type ModelParams = z.infer<typeof modelParamsSchema>;
@@ -20,6 +25,15 @@ export const simulationRequestSchema = modelParamsSchema.extend({
     .int()
     .min(1_000)
     .max(10_000_000),
+  // Optional fixed seed for reproducible runs (identical results across
+  // submissions); omitted means a random seed per job. Also what the
+  // chaos test uses to compare a disrupted run against a control run.
+  seed: z
+    .number()
+    .int()
+    .min(0)
+    .max(2 ** 31 - 1)
+    .optional(),
 });
 
 export type SimulationRequest = z.infer<typeof simulationRequestSchema>;

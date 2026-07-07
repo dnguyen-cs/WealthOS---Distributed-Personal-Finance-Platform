@@ -38,6 +38,7 @@ export function RunSimulationForm({ defaultInitialValue, disabled, onSubmit }: P
       volatility: Number(volatilityPct) / 100,
       years: Number(years),
       pathCount,
+      antithetic: true,
     });
   }
 
