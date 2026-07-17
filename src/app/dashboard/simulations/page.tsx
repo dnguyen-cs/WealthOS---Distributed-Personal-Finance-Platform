@@ -38,6 +38,7 @@ export default async function SimulationsPage() {
     return {
       id: job.id,
       status: job.status,
+      engine: job.engine,
       pathCount: job.pathCount,
       years: params.years ?? 0,
       createdAt: job.createdAt.toISOString(),

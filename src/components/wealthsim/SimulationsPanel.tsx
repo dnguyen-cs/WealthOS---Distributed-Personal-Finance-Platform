@@ -12,6 +12,7 @@ import { RunSimulationForm } from '@/components/wealthsim/RunSimulationForm';
 export interface RecentJob {
   id: string;
   status: string;
+  engine: string;
   pathCount: number;
   years: number;
   createdAt: string;
@@ -157,7 +158,8 @@ export function SimulationsPanel({ defaultInitialValue, recentJobs }: Props) {
           <p className="text-xs opacity-60 tabular-nums">
             {result.pathsCompleted.toLocaleString('en-US')} paths in {(result.wallMs / 1000).toFixed(1)}s
             wall time ({Math.round(result.pathsCompleted / (result.wallMs / 1000)).toLocaleString('en-US')}{' '}
-            paths/s effective) across {payload?.chunkCount} chunks.
+            paths/s effective) across {payload?.chunkCount} chunks on the{' '}
+            {payload?.engine === 'go' ? 'Go' : 'Node.js'} engine.
           </p>
         </section>
       )}
@@ -178,7 +180,8 @@ export function SimulationsPanel({ defaultInitialValue, recentJobs }: Props) {
                 >
                   <span>
                     {formatDate(new Date(job.createdAt))} ·{' '}
-                    {job.pathCount.toLocaleString('en-US')} paths · {job.years}y
+                    {job.pathCount.toLocaleString('en-US')} paths · {job.years}y ·{' '}
+                    {job.engine === 'go' ? 'Go' : 'Node.js'}
                   </span>
                   <span className="tabular-nums opacity-70">
                     {job.status === 'completed' && job.medianAtHorizon !== null

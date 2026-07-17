@@ -5,7 +5,7 @@ import {
   SQSClient,
 } from '@aws-sdk/client-sqs';
 
-import { chunkSpecSchema, type ChunkSpec } from '@/lib/wealthsim/types';
+import { chunkSpecSchema, type ChunkSpec, type Engine } from '@/lib/wealthsim/types';
 
 // A standard queue, not FIFO: FIFO locks a message group while one of its
 // messages is in flight, so grouping a job's chunks would serialize them
@@ -25,15 +25,22 @@ export const sqs =
 
 if (process.env.NODE_ENV !== 'production') globalForSqs.sqs = sqs;
 
-export function queueUrl(): string {
-  const url = process.env.WEALTHSIM_QUEUE_URL;
-  if (!url) throw new Error('WEALTHSIM_QUEUE_URL is not set');
+// One queue per engine: SQS cannot filter on receive, so mixed consumers
+// on a single queue would poison each other. A side effect worth having:
+// a redelivered chunk always lands on a same-engine worker, preserving
+// per-engine byte-identity of reprocessed results. Workers read their own
+// queue from WEALTHSIM_QUEUE_URL directly; this selector is for the
+// producer side.
+export function queueUrl(engine: Engine = 'node'): string {
+  const name = engine === 'go' ? 'WEALTHSIM_QUEUE_URL_GO' : 'WEALTHSIM_QUEUE_URL';
+  const url = process.env[name];
+  if (!url) throw new Error(`${name} is not set`);
   return url;
 }
 
 const BATCH_LIMIT = 10;
 
-export async function enqueueChunks(chunks: ChunkSpec[]): Promise<void> {
+export async function enqueueChunks(chunks: ChunkSpec[], engine: Engine = 'node'): Promise<void> {
   for (let offset = 0; offset < chunks.length; offset += BATCH_LIMIT) {
     let pending = chunks.slice(offset, offset + BATCH_LIMIT);
     // Retrying a partially failed batch cannot double-process work: a
@@ -41,7 +48,7 @@ export async function enqueueChunks(chunks: ChunkSpec[]): Promise<void> {
     for (let attempt = 0; attempt < 3 && pending.length > 0; attempt++) {
       const result = await sqs.send(
         new SendMessageBatchCommand({
-          QueueUrl: queueUrl(),
+          QueueUrl: queueUrl(engine),
           Entries: pending.map((chunk) => ({
             Id: String(chunk.chunkIndex),
             MessageBody: JSON.stringify(chunk),

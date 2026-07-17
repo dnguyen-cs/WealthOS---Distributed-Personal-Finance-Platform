@@ -4,8 +4,13 @@ import { prisma } from '@/lib/db/prisma';
 import { aggregateChunkSummaries } from '@/lib/wealthsim/aggregate';
 import { DEFAULT_CHUNK_SIZE, planChunks } from '@/lib/wealthsim/chunking';
 import { enqueueChunks } from '@/lib/wealthsim/queue';
-import { getChunkSummaries, listChunkKeys } from '@/lib/wealthsim/storage';
 import {
+  CorruptChunkSummaryError,
+  getChunkSummaries,
+  listChunkKeys,
+} from '@/lib/wealthsim/storage';
+import {
+  type ChunkSummary,
   modelParamsSchema,
   type SimulationRequest,
   type YearlyStat,
@@ -23,6 +28,7 @@ import type { Prisma, SimulationJob, SimulationResult } from '@/generated/prisma
 export interface JobStatusPayload {
   id: string;
   status: SimulationJob['status'];
+  engine: string;
   params: Prisma.JsonValue;
   pathCount: number;
   chunkCount: number;
@@ -45,6 +51,7 @@ function toPayload(
   return {
     id: job.id,
     status: job.status,
+    engine: job.engine,
     params: job.params,
     pathCount: job.pathCount,
     chunkCount: job.chunkCount,
@@ -67,7 +74,7 @@ export async function createSimulationJob(
   userId: string,
   request: SimulationRequest,
 ): Promise<SimulationJob> {
-  const { pathCount, seed: requestedSeed, ...params } = request;
+  const { pathCount, seed: requestedSeed, engine, ...params } = request;
   // Postgres int4 caps at 2^31 - 1; the seed is remixed through
   // splitmix32 anyway, so 31 bits of entropy is as good as 32 here.
   const seed = requestedSeed ?? randomInt(0, 2 ** 31);
@@ -77,6 +84,7 @@ export async function createSimulationJob(
   const job = await prisma.simulationJob.create({
     data: {
       userId,
+      engine,
       params,
       pathCount,
       chunkCount,
@@ -86,7 +94,7 @@ export async function createSimulationJob(
   });
 
   try {
-    await enqueueChunks(planChunks(job.id, pathCount, seed, params, chunkSize));
+    await enqueueChunks(planChunks(job.id, pathCount, seed, params, chunkSize), engine);
   } catch (error) {
     await prisma.simulationJob.update({
       where: { id: job.id },
@@ -131,7 +139,24 @@ export async function getJobStatus(
     return toPayload(job, keys.length);
   }
 
-  const summaries = await getChunkSummaries(keys);
+  let summaries: ChunkSummary[];
+  try {
+    summaries = await getChunkSummaries(keys);
+  } catch (error) {
+    if (error instanceof CorruptChunkSummaryError) {
+      // Deterministic poison: the object exists but will never validate,
+      // so every future read would fail identically and the job would
+      // wedge in "running" with no DLQ signal (the worker "succeeded").
+      // Fail the job loudly instead; transient S3 errors still bubble up
+      // as retryable 502s.
+      const failed = await prisma.simulationJob.update({
+        where: { id: job.id },
+        data: { status: 'failed', error: `Corrupt chunk result (${error.key})` },
+      });
+      return toPayload({ ...failed, result: null }, 0);
+    }
+    throw error;
+  }
   const params = modelParamsSchema.parse(job.params);
   const { pathCount, yearlyStats } = aggregateChunkSummaries(params, summaries);
   const totalComputeMs = Math.round(

@@ -19,6 +19,16 @@ export const modelParamsSchema = z.object({
 
 export type ModelParams = z.infer<typeof modelParamsSchema>;
 
+// Two implementations of the same kernel contract (Node and Go) consume
+// engine-specific queues. Their results are interchangeable - the Go port
+// is parity-tested against Node-generated vectors (bit-exact RNG streams,
+// summaries within ulps) - but a job's chunks are never mixed across
+// engines: redelivery must stay within an engine so per-engine reruns are
+// byte-identical.
+export const engineSchema = z.enum(['node', 'go']);
+
+export type Engine = z.infer<typeof engineSchema>;
+
 export const simulationRequestSchema = modelParamsSchema.extend({
   pathCount: z
     .number()
@@ -34,6 +44,7 @@ export const simulationRequestSchema = modelParamsSchema.extend({
     .min(0)
     .max(2 ** 31 - 1)
     .optional(),
+  engine: engineSchema.default('node'),
 });
 
 export type SimulationRequest = z.infer<typeof simulationRequestSchema>;

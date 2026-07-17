@@ -85,13 +85,33 @@ export async function listChunkKeys(jobId: string): Promise<string[]> {
   return keys;
 }
 
+// A summary object that exists but cannot be parsed or validated is a
+// deterministic failure: S3 puts are atomic, so the bytes came from a
+// worker bug and no retry or redelivery will ever repair them. Callers
+// need to tell this apart from transient S3 errors, which stay retryable.
+export class CorruptChunkSummaryError extends Error {
+  constructor(
+    readonly key: string,
+    cause: unknown,
+  ) {
+    super(
+      `corrupt chunk summary at ${key}: ${cause instanceof Error ? cause.message : String(cause)}`,
+    );
+    this.name = 'CorruptChunkSummaryError';
+  }
+}
+
 export async function getChunkSummaries(keys: string[]): Promise<ChunkSummary[]> {
   return Promise.all(
     keys.map(async (key) => {
       const result = await s3.send(new GetObjectCommand({ Bucket: bucketName(), Key: key }));
       const body = await result.Body?.transformToString();
-      if (!body) throw new Error(`getChunkSummaries: empty object at ${key}`);
-      return chunkSummarySchema.parse(JSON.parse(body));
+      if (!body) throw new CorruptChunkSummaryError(key, new Error('empty object'));
+      try {
+        return chunkSummarySchema.parse(JSON.parse(body));
+      } catch (error) {
+        throw new CorruptChunkSummaryError(key, error);
+      }
     }),
   );
 }

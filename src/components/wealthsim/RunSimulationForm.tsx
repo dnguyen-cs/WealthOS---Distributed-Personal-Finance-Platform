@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 
-import type { SimulationRequest } from '@/lib/wealthsim/types';
+import type { Engine, SimulationRequest } from '@/lib/wealthsim/types';
 
 const PATH_COUNT_OPTIONS = [
   { value: 100_000, label: '100K paths' },
@@ -10,6 +10,13 @@ const PATH_COUNT_OPTIONS = [
   { value: 1_000_000, label: '1M paths' },
   { value: 2_000_000, label: '2M paths' },
   { value: 5_000_000, label: '5M paths' },
+];
+
+// Same kernel contract, two implementations; results are parity-tested
+// interchangeable, so this is a routing choice, not a math choice.
+const ENGINE_OPTIONS: Array<{ value: Engine; label: string }> = [
+  { value: 'node', label: 'Node.js workers' },
+  { value: 'go', label: 'Go workers' },
 ];
 
 const inputClassName =
@@ -28,6 +35,7 @@ export function RunSimulationForm({ defaultInitialValue, disabled, onSubmit }: P
   const [volatilityPct, setVolatilityPct] = useState('15');
   const [years, setYears] = useState('30');
   const [pathCount, setPathCount] = useState(1_000_000);
+  const [engine, setEngine] = useState<Engine>('node');
 
   function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -39,6 +47,7 @@ export function RunSimulationForm({ defaultInitialValue, disabled, onSubmit }: P
       years: Number(years),
       pathCount,
       antithetic: true,
+      engine,
     });
   }
 
@@ -116,6 +125,20 @@ export function RunSimulationForm({ defaultInitialValue, disabled, onSubmit }: P
           className={inputClassName}
         >
           {PATH_COUNT_OPTIONS.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="flex flex-col gap-1 text-sm">
+        Compute engine
+        <select
+          value={engine}
+          onChange={(e) => setEngine(e.target.value as Engine)}
+          className={inputClassName}
+        >
+          {ENGINE_OPTIONS.map((option) => (
             <option key={option.value} value={option.value}>
               {option.label}
             </option>

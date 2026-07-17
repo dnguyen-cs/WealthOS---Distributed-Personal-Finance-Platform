@@ -77,6 +77,9 @@ model SimulationJob {
   userId      String
   user        User                @relation(fields: [userId], references: [id], onDelete: Cascade)
   status      SimulationJobStatus @default(queued)
+  // which worker implementation ran this job ("node" | "go"); chunks are
+  // routed to the engine's own queue and never mixed within a job
+  engine      String              @default("node")
   params      Json
   pathCount   Int
   chunkCount  Int
