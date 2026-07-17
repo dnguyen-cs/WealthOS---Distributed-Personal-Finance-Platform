@@ -65,6 +65,7 @@ services:
       REDIS_URL: redis://redis:6379
       SQS_ENDPOINT: http://queue:9324
       WEALTHSIM_QUEUE_URL: http://queue:9324/000000000000/wealthsim-jobs
+      WEALTHSIM_QUEUE_URL_GO: http://queue:9324/000000000000/wealthsim-jobs-go
       S3_ENDPOINT: http://objectstore:9000
     depends_on:
       db:
@@ -85,6 +86,23 @@ services:
     environment:
       SQS_ENDPOINT: http://queue:9324
       WEALTHSIM_QUEUE_URL: http://queue:9324/000000000000/wealthsim-jobs
+      S3_ENDPOINT: http://objectstore:9000
+    depends_on:
+      queue:
+        condition: service_started
+      objectstore:
+        condition: service_healthy
+
+  # Go edition of the compute worker, consuming the engine's own queue;
+  # scale with: docker compose up -d --scale worker-go=4 worker-go
+  worker-go:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker-go
+    env_file: .env
+    environment:
+      SQS_ENDPOINT: http://queue:9324
+      WEALTHSIM_QUEUE_URL: http://queue:9324/000000000000/wealthsim-jobs-go
       S3_ENDPOINT: http://objectstore:9000
     depends_on:
       queue:
