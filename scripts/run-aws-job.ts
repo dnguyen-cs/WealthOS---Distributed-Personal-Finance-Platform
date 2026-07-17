@@ -14,7 +14,8 @@
 
 import { prisma } from '@/lib/db/prisma';
 import { createSimulationJob, getJobStatus } from '@/lib/wealthsim/jobs';
-import type { SimulationRequest } from '@/lib/wealthsim/types';
+import { queueUrl } from '@/lib/wealthsim/queue';
+import { engineSchema, type SimulationRequest } from '@/lib/wealthsim/types';
 
 const BENCH_EMAIL = 'aws-bench@local';
 
@@ -32,8 +33,9 @@ async function main() {
   if (process.env.SQS_ENDPOINT || process.env.S3_ENDPOINT) {
     throw new Error('endpoint overrides are set; this script targets real AWS only');
   }
-  if (!requireEnv('WEALTHSIM_QUEUE_URL').includes('sqs.us-east-1.amazonaws.com')) {
-    throw new Error('WEALTHSIM_QUEUE_URL does not look like a real SQS URL');
+  const engine = engineSchema.parse(process.env.ENGINE ?? 'node');
+  if (!queueUrl(engine).includes('sqs.us-east-1.amazonaws.com')) {
+    throw new Error(`the ${engine} engine queue URL does not look like a real SQS URL`);
   }
   requireEnv('WEALTHSIM_BUCKET');
   requireEnv('DATABASE_URL');
@@ -50,6 +52,7 @@ async function main() {
     antithetic: true,
     pathCount,
     seed,
+    engine,
   };
 
   const user = await prisma.user.upsert({

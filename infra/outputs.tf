@@ -3,6 +3,21 @@ output "wealthsim_queue_url" {
   value       = aws_sqs_queue.wealthsim_jobs.url
 }
 
+output "wealthsim_queue_url_go" {
+  description = "Go engine SQS queue URL - app WEALTHSIM_QUEUE_URL_GO"
+  value       = aws_sqs_queue.wealthsim_jobs_go.url
+}
+
+output "wealthsim_ecr_repository_url_go" {
+  description = "Push the Go worker image here (docker/Dockerfile.worker-go)"
+  value       = aws_ecr_repository.wealthsim_worker_go.repository_url
+}
+
+output "wealthsim_job_definition_go" {
+  description = "Go engine Batch job definition name"
+  value       = aws_batch_job_definition.wealthsim_worker_go.name
+}
+
 output "wealthsim_bucket" {
   description = "S3 bucket for chunk summaries - app WEALTHSIM_BUCKET"
   value       = aws_s3_bucket.wealthsim_results.bucket

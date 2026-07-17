@@ -19,6 +19,7 @@ jobs:
       PLAID_TOKEN_ENC_KEY: '0000000000000000000000000000000000000000000000000000000000000000'
       AWS_REGION: us-east-1
       WEALTHSIM_QUEUE_URL: http://localhost:9324/000000000000/wealthsim-jobs
+      WEALTHSIM_QUEUE_URL_GO: http://localhost:9324/000000000000/wealthsim-jobs-go
       WEALTHSIM_BUCKET: ci
     steps:
       - uses: actions/checkout@v4
@@ -34,6 +35,24 @@ jobs:
       - run: pnpm build
       # the vitest suite is intentionally not in version control, so CI
       # covers lint/types/build; tests run locally via `pnpm test`
+
+  go-worker:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go-worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go-worker/go.mod
+          cache-dependency-path: go-worker/go.sum
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go build ./...
+      # parity tests skip themselves when testdata vectors are absent, so
+      # this stays green regardless of what is committed
+      - run: go test ./...
 
   terraform:
     runs-on: ubuntu-latest

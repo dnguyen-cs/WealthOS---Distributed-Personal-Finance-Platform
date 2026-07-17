@@ -47,7 +47,13 @@ data "aws_iam_policy_document" "wealthsim_task" {
       "sqs:DeleteMessage",
       "sqs:GetQueueAttributes",
     ]
-    resources = [aws_sqs_queue.wealthsim_jobs.arn]
+    # both engines' queues share one task role: same trust domain, same
+    # blast radius, and each worker only ever polls the queue its job
+    # definition points it at
+    resources = [
+      aws_sqs_queue.wealthsim_jobs.arn,
+      aws_sqs_queue.wealthsim_jobs_go.arn,
+    ]
   }
 
   statement {
@@ -149,6 +155,60 @@ resource "aws_batch_job_definition" "wealthsim_worker" {
         "awslogs-group"         = aws_cloudwatch_log_group.wealthsim_worker.name
         "awslogs-region"        = "us-east-1"
         "awslogs-stream-prefix" = "worker"
+      }
+    }
+  })
+
+  retry_strategy {
+    attempts = 2
+  }
+
+  timeout {
+    # hard stop: no worker should ever live longer than an hour
+    attempt_duration_seconds = 3600
+  }
+}
+
+# Go edition of the worker: same compute environment, same roles, same
+# invariants - only the image and the queue differ. Benchmark fleets can
+# override VCPU/MEMORY and GOWORKER_CONCURRENCY at submit time to compare
+# one 4-vCPU task against four 1-vCPU tasks cost-normalized.
+resource "aws_batch_job_definition" "wealthsim_worker_go" {
+  name                  = "wealthsim-worker-go"
+  type                  = "container"
+  platform_capabilities = ["FARGATE"]
+
+  container_properties = jsonencode({
+    image            = "${aws_ecr_repository.wealthsim_worker_go.repository_url}:latest"
+    executionRoleArn = aws_iam_role.wealthsim_execution.arn
+    jobRoleArn       = aws_iam_role.wealthsim_task.arn
+
+    resourceRequirements = [
+      { type = "VCPU", value = "1" },
+      { type = "MEMORY", value = "2048" },
+    ]
+
+    networkConfiguration = {
+      assignPublicIp = "ENABLED"
+    }
+
+    environment = [
+      { name = "WEALTHSIM_QUEUE_URL", value = aws_sqs_queue.wealthsim_jobs_go.url },
+      { name = "WEALTHSIM_BUCKET", value = aws_s3_bucket.wealthsim_results.bucket },
+      { name = "AWS_REGION", value = "us-east-1" },
+      # MUST exceed the queue's 300s visibility timeout: if a worker dies
+      # with a chunk in flight, the survivors have to still be alive when
+      # SQS redelivers it, or the fleet self-terminates with work stranded
+      # invisible in the queue (found by the AWS chaos test 2026-07-07)
+      { name = "WORKER_IDLE_EXIT_SECONDS", value = "360" },
+    ]
+
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        "awslogs-group"         = aws_cloudwatch_log_group.wealthsim_worker.name
+        "awslogs-region"        = "us-east-1"
+        "awslogs-stream-prefix" = "worker-go"
       }
     }
   })

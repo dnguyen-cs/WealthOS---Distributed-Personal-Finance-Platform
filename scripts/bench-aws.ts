@@ -25,13 +25,25 @@ import {
 
 import { prisma } from '@/lib/db/prisma';
 import { createSimulationJob, getJobStatus } from '@/lib/wealthsim/jobs';
-import type { SimulationRequest } from '@/lib/wealthsim/types';
+import { queueUrl } from '@/lib/wealthsim/queue';
+import { engineSchema, type SimulationRequest } from '@/lib/wealthsim/types';
 
 const BENCH_EMAIL = 'aws-bench@local';
 const JOB_QUEUE = 'wealthsim';
-const JOB_DEFINITION = 'wealthsim-worker';
-// Fargate us-east-1: $0.04048/vCPU-hr + $0.004445/GB-hr; worker = 1 vCPU + 2GB
-const WORKER_DOLLARS_PER_SECOND = (0.04048 + 2 * 0.004445) / 3600;
+
+// ENGINE selects which worker implementation the fleet runs (and which
+// queue the job fans out onto): 'node' | 'go'.
+const engine = engineSchema.parse(process.env.ENGINE ?? 'node');
+const JOB_DEFINITION = engine === 'go' ? 'wealthsim-worker-go' : 'wealthsim-worker';
+
+// Fargate task size (memory scales 2 GB per vCPU). Multi-vCPU tasks only
+// make sense for the Go engine, which runs CONCURRENCY independent poll
+// loops per task; the Node worker is single-threaded per task.
+const vcpus = Number(process.env.VCPUS ?? 1);
+const concurrency = Number(process.env.CONCURRENCY ?? vcpus);
+
+// Fargate us-east-1: $0.04048/vCPU-hr + $0.004445/GB-hr
+const WORKER_DOLLARS_PER_SECOND = (vcpus * (0.04048 + 2 * 0.004445)) / 3600;
 
 const workerCounts = (process.env.WORKERS ?? '1,2,4,8').split(',').map(Number);
 const pathCounts = (process.env.PATHS_LIST ?? '1000000,10000000').split(',').map(Number);
@@ -53,6 +65,7 @@ function requestFor(pathCount: number): SimulationRequest {
     antithetic: true,
     pathCount,
     seed: 20260700 + pathCount / 1_000_000,
+    engine,
   };
 }
 
@@ -61,9 +74,22 @@ async function submitFleet(size: number): Promise<string[]> {
   for (let index = 0; index < size; index++) {
     const result = await batch.send(
       new SubmitJobCommand({
-        jobName: `bench-fleet-${size}-${index}`,
+        jobName: `bench-fleet-${engine}-${size}-${index}`,
         jobQueue: JOB_QUEUE,
         jobDefinition: JOB_DEFINITION,
+        containerOverrides: {
+          ...(vcpus !== 1
+            ? {
+                resourceRequirements: [
+                  { type: 'VCPU' as const, value: String(vcpus) },
+                  { type: 'MEMORY' as const, value: String(2048 * vcpus) },
+                ],
+              }
+            : {}),
+          ...(engine === 'go' && concurrency !== 1
+            ? { environment: [{ name: 'GOWORKER_CONCURRENCY', value: String(concurrency) }] }
+            : {}),
+        },
       }),
     );
     ids.push(result.jobId!);
@@ -127,8 +153,8 @@ async function main() {
   if (process.env.SQS_ENDPOINT || process.env.S3_ENDPOINT) {
     throw new Error('endpoint overrides are set; this script targets real AWS only');
   }
-  if (!(process.env.WEALTHSIM_QUEUE_URL ?? '').includes('sqs.us-east-1.amazonaws.com')) {
-    throw new Error('WEALTHSIM_QUEUE_URL does not look like a real SQS URL');
+  if (!queueUrl(engine).includes('sqs.us-east-1.amazonaws.com')) {
+    throw new Error(`the ${engine} engine queue URL does not look like a real SQS URL`);
   }
 
   const user = await prisma.user.upsert({
@@ -142,7 +168,8 @@ async function main() {
   const reference = new Map<number, string>();
 
   console.log(
-    `AWS Batch scaling benchmark: workers=[${workerCounts}] paths=[${pathCounts}] repeats=${repeats}`,
+    `AWS Batch scaling benchmark: engine=${engine} workers=[${workerCounts}] ` +
+      `paths=[${pathCounts}] repeats=${repeats} vcpus=${vcpus} concurrency=${concurrency}`,
   );
 
   for (const workers of workerCounts) {
@@ -169,6 +196,9 @@ async function main() {
           const dollars = workers * (wallMs / 1000) * WORKER_DOLLARS_PER_SECOND;
           const record = {
             timestamp: new Date().toISOString(),
+            engine,
+            vcpus,
+            concurrency,
             workers,
             pathCount,
             rep,

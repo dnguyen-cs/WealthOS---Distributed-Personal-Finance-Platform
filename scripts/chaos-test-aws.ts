@@ -16,11 +16,16 @@ import {
 
 import { prisma } from '@/lib/db/prisma';
 import { createSimulationJob, getJobStatus } from '@/lib/wealthsim/jobs';
-import type { SimulationRequest } from '@/lib/wealthsim/types';
+import { engineSchema, type SimulationRequest } from '@/lib/wealthsim/types';
 
 const CHAOS_EMAIL = 'aws-bench@local';
 const SEED = 20260708;
 const KILL_AFTER_CHUNKS = 8;
+
+// ENGINE=go terminates a Go-fleet Fargate task instead; the liveness and
+// idempotency invariants are engine-independent and tested per engine.
+const engine = engineSchema.parse(process.env.ENGINE ?? 'node');
+const JOB_DEFINITION = engine === 'go' ? 'wealthsim-worker-go' : 'wealthsim-worker';
 
 const request: SimulationRequest = {
   initialValue: 100_000,
@@ -31,6 +36,7 @@ const request: SimulationRequest = {
   antithetic: true,
   pathCount: 2_000_000,
   seed: SEED,
+  engine,
 };
 
 const batch = new BatchClient({ region: process.env.AWS_REGION ?? 'us-east-1' });
@@ -44,9 +50,9 @@ async function submitFleet(size: number): Promise<string[]> {
   for (let index = 0; index < size; index++) {
     const result = await batch.send(
       new SubmitJobCommand({
-        jobName: `chaos-fleet-${index}`,
+        jobName: `chaos-fleet-${engine}-${index}`,
         jobQueue: 'wealthsim',
-        jobDefinition: 'wealthsim-worker',
+        jobDefinition: JOB_DEFINITION,
         // survivors must outlive the 300s visibility timeout or the
         // redelivered chunk finds no consumer (the bug this test caught)
         containerOverrides: {
@@ -134,7 +140,7 @@ async function main() {
     update: {},
   });
 
-  console.log('starting fleet of 2 Fargate workers');
+  console.log(`starting fleet of 2 Fargate workers (${engine} engine)`);
   const fleet = await submitFleet(2);
   try {
     await waitAllRunning(fleet);

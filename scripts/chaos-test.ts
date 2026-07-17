@@ -18,11 +18,16 @@ import { execSync } from 'node:child_process';
 
 import { prisma } from '@/lib/db/prisma';
 import { createSimulationJob, getJobStatus } from '@/lib/wealthsim/jobs';
-import type { SimulationRequest } from '@/lib/wealthsim/types';
+import { engineSchema, type SimulationRequest } from '@/lib/wealthsim/types';
 
 const CHAOS_EMAIL = 'chaos-test@local';
 const SEED = 20260706;
 const KILL_AFTER_CHUNKS = 8;
+
+// ENGINE=go targets the Go worker fleet (compose service "worker-go");
+// default is the Node fleet. The idempotency claim must hold per engine.
+const engine = engineSchema.parse(process.env.ENGINE ?? 'node');
+const workerService = engine === 'go' ? 'worker-go' : 'worker';
 
 const request: SimulationRequest = {
   initialValue: 100_000,
@@ -33,6 +38,7 @@ const request: SimulationRequest = {
   antithetic: true,
   pathCount: 2_000_000,
   seed: SEED,
+  engine,
 };
 
 function sleep(ms: number): Promise<void> {
@@ -40,7 +46,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 function workerContainerIds(): string[] {
-  return execSync('docker compose ps -q worker', { encoding: 'utf8' })
+  return execSync(`docker compose ps -q ${workerService}`, { encoding: 'utf8' })
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean);
@@ -100,8 +106,8 @@ async function main() {
   const workers = workerContainerIds();
   if (workers.length < 2) {
     console.error(
-      `Need at least 2 workers (found ${workers.length}). Start them with:\n` +
-        '  docker compose up -d --scale worker=2 worker',
+      `Need at least 2 ${engine} workers (found ${workers.length}). Start them with:\n` +
+        `  docker compose up -d --scale ${workerService}=2 ${workerService}`,
     );
     process.exit(1);
   }
@@ -134,7 +140,9 @@ async function main() {
       `control ${(control.wallMs / 1000).toFixed(1)}s, chaos ${(chaos.wallMs / 1000).toFixed(1)}s ` +
       'including redelivery wait).',
   );
-  console.log('Restore the worker fleet with: docker compose up -d --scale worker=2 worker');
+  console.log(
+    `Restore the worker fleet with: docker compose up -d --scale ${workerService}=2 ${workerService}`,
+  );
 }
 
 main()
