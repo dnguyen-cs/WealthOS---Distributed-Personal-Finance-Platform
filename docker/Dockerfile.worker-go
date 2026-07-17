@@ -1,0 +1,21 @@
+# WealthSim compute worker, Go edition. Multi-stage: the builder compiles
+# a static binary (CGO off), the runtime stage is distroless - no shell,
+# no package manager, just the binary and CA certificates. The result is
+# ~15 MB versus ~600 MB for the Node worker image, which matters twice on
+# Fargate: image pull dominates fleet cold start, and cross-AZ/regional
+# data transfer for a 64-task fleet is billed per GB pulled.
+FROM golang:1.26-alpine AS build
+
+WORKDIR /src
+
+COPY go-worker/go.mod go-worker/go.sum ./
+RUN go mod download
+
+COPY go-worker/ ./
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/worker ./cmd/worker
+
+FROM gcr.io/distroless/static-debian12:nonroot
+
+COPY --from=build /out/worker /worker
+
+ENTRYPOINT ["/worker"]
