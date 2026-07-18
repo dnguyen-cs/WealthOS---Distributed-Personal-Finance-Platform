@@ -26,9 +26,11 @@ interface Props {
   defaultInitialValue: number;
   disabled: boolean;
   onSubmit: (request: SimulationRequest) => void;
+  /** Race mode: run the same request (same seed) on both engines at once. */
+  onRace: (request: Omit<SimulationRequest, 'engine'>) => void;
 }
 
-export function RunSimulationForm({ defaultInitialValue, disabled, onSubmit }: Props) {
+export function RunSimulationForm({ defaultInitialValue, disabled, onSubmit, onRace }: Props) {
   const [initialValue, setInitialValue] = useState(String(defaultInitialValue));
   const [annualContribution, setAnnualContribution] = useState('12000');
   const [meanReturnPct, setMeanReturnPct] = useState('7');
@@ -37,9 +39,8 @@ export function RunSimulationForm({ defaultInitialValue, disabled, onSubmit }: P
   const [pathCount, setPathCount] = useState(1_000_000);
   const [engine, setEngine] = useState<Engine>('node');
 
-  function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    onSubmit({
+  function baseRequest(): Omit<SimulationRequest, 'engine'> {
+    return {
       initialValue: Number(initialValue),
       annualContribution: Number(annualContribution),
       meanReturn: Number(meanReturnPct) / 100,
@@ -47,8 +48,12 @@ export function RunSimulationForm({ defaultInitialValue, disabled, onSubmit }: P
       years: Number(years),
       pathCount,
       antithetic: true,
-      engine,
-    });
+    };
+  }
+
+  function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    onSubmit({ ...baseRequest(), engine });
   }
 
   return (
@@ -145,7 +150,7 @@ export function RunSimulationForm({ defaultInitialValue, disabled, onSubmit }: P
           ))}
         </select>
       </label>
-      <div className="col-span-2 sm:col-span-3">
+      <div className="col-span-2 flex flex-wrap items-center gap-3 sm:col-span-3">
         <button
           type="submit"
           disabled={disabled}
@@ -153,6 +158,18 @@ export function RunSimulationForm({ defaultInitialValue, disabled, onSubmit }: P
         >
           {disabled ? 'Running…' : 'Run simulation'}
         </button>
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => onRace(baseRequest())}
+          className="rounded-md border border-black/15 px-4 py-2 text-sm font-medium transition-colors hover:bg-black/5 disabled:opacity-50 dark:border-white/20 dark:hover:bg-white/5"
+        >
+          Race both engines
+        </button>
+        <span className="text-xs opacity-60">
+          Race mode runs the identical seed on Node.js and Go simultaneously, then verifies the
+          results match.
+        </span>
       </div>
     </form>
   );
