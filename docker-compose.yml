@@ -52,6 +52,27 @@ services:
       timeout: 3s
       retries: 10
 
+  # Local Kinesis stand-in for PortfolioPulse (dev-only emulator; AWS
+  # provides the real stream). Same one-emulator-per-service pattern as
+  # ElasticMQ/MinIO - LocalStack was rejected because its current images
+  # require license activation.
+  stream:
+    image: ghcr.io/etspaceman/kinesis-mock:0.6.2
+    environment:
+      SHOULD_LOG: "false"
+    ports:
+      - "4568:4568" # plain-HTTP listener
+
+  # Local DynamoDB stand-in for PortfolioPulse (dev-only emulator; AWS
+  # provides the real table). -sharedDb: one database regardless of the
+  # caller's credentials - without it dynamodb-local namespaces tables per
+  # access key and different tools silently see different data.
+  table:
+    image: amazon/dynamodb-local:latest
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    ports:
+      - "8000:8000"
+
   app:
     build:
       context: .
@@ -67,6 +88,8 @@ services:
       WEALTHSIM_QUEUE_URL: http://queue:9324/000000000000/wealthsim-jobs
       WEALTHSIM_QUEUE_URL_GO: http://queue:9324/000000000000/wealthsim-jobs-go
       S3_ENDPOINT: http://objectstore:9000
+      KINESIS_ENDPOINT: http://stream:4568
+      DYNAMODB_ENDPOINT: http://table:8000
     depends_on:
       db:
         condition: service_healthy

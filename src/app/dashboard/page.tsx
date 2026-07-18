@@ -7,6 +7,7 @@ import { computeNetWorth } from '@/lib/networth';
 import { AccountList, type BankItem } from '@/components/portfolio/AccountList';
 import { PlaidLinkButton } from '@/components/portfolio/PlaidLinkButton';
 import { TransactionTable, type TransactionRow } from '@/components/portfolio/TransactionTable';
+import { PulseTile } from '@/components/pulse/PulseTile';
 import { SignOutButton } from '@/components/ui/SignOutButton';
 
 export default async function DashboardPage() {
@@ -74,6 +75,8 @@ export default async function DashboardPage() {
           <SignOutButton />
         </div>
       </header>
+
+      <PulseTile />
 
       {hasBanks ? (
         <>
