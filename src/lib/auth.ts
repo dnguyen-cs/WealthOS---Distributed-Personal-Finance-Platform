@@ -3,6 +3,8 @@ import Credentials from 'next-auth/providers/credentials';
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
 import { prisma } from '@/lib/db/prisma';
+import { fixedWindowLimit } from '@/lib/rate-limit';
+import { clientIp } from '@/lib/request-ip';
 
 const credentialsSchema = z.object({
   email: z.email(),
@@ -18,7 +20,19 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         email: { label: 'Email', type: 'email' },
         password: { label: 'Password', type: 'password' },
       },
-      async authorize(credentials) {
+      async authorize(credentials, request) {
+        // Attempts are counted per IP, successes included: Auth.js can only
+        // surface a generic failure from here, so the limit (20 per 15 min)
+        // stays far above any legitimate use while still smothering
+        // credential stuffing. Fail closed - a Redis outage rejects logins
+        // rather than opening an unmetered guessing window.
+        const attempts = await fixedWindowLimit(
+          `rl:login:${clientIp(request)}`,
+          20,
+          15 * 60,
+        );
+        if (!attempts.allowed) return null;
+
         const parsed = credentialsSchema.safeParse(credentials);
         if (!parsed.success) return null;
 

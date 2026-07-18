@@ -2,6 +2,8 @@ import { NextResponse } from 'next/server';
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
 import { prisma } from '@/lib/db/prisma';
+import { fixedWindowLimit } from '@/lib/rate-limit';
+import { clientIp } from '@/lib/request-ip';
 
 const bodySchema = z.object({
   email: z.email(),
@@ -10,6 +12,24 @@ const bodySchema = z.object({
 });
 
 export async function POST(request: Request) {
+  // Fail closed: unmetered registration is the cheapest way to farm
+  // accounts that then each get their own run-endpoint rate window.
+  try {
+    const limit = await fixedWindowLimit(`rl:register:${clientIp(request)}`, 10, 60 * 60);
+    if (!limit.allowed) {
+      return NextResponse.json(
+        { error: 'Too many registrations from this address; try again later.' },
+        { status: 429, headers: { 'Retry-After': String(limit.retryAfterSeconds) } },
+      );
+    }
+  } catch (error) {
+    console.error('register rate limiter unavailable', error);
+    return NextResponse.json(
+      { error: 'Service temporarily unavailable; try again shortly.' },
+      { status: 503 },
+    );
+  }
+
   const json = await request.json().catch(() => null);
   const parsed = bodySchema.safeParse(json);
   if (!parsed.success) {
