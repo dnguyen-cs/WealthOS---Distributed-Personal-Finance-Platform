@@ -1,16 +1,26 @@
 import { PrismaClient } from '@/generated/prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
 
-// DATABASE_URL may point at a transaction-mode pooler (Neon's -pooler
-// PgBouncer endpoint in the hosted deploy): the pg adapter speaks the
-// extended protocol with unnamed prepared statements only, which
-// transaction pooling supports. Serverless fan-out therefore multiplexes
-// through the pooler instead of exhausting direct Postgres connections.
-// Migrations are the exception - run `prisma migrate deploy` against the
-// direct (non-pooled) endpoint.
+// Hosted DATABASE_URL points at Aurora Serverless v2 with min 0 ACU:
+// the database auto-pauses when idle and the first connection after a
+// pause waits out the ~15s resume, so the connect timeout must be
+// generous. There is no pooler in front (RDS Proxy is VPC-only and
+// unreachable from Vercel), so each serverless instance keeps its own
+// small pg pool - a handful of instances stays far under Aurora's
+// connection limits at demo traffic. Migrations run from a local shell:
+// `prisma migrate deploy` against the same endpoint.
+function envInt(name: string, fallback: number): number {
+  const raw = Number(process.env[name]);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback;
+}
+
 function createClient() {
   return new PrismaClient({
-    adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }),
+    adapter: new PrismaPg({
+      connectionString: process.env.DATABASE_URL,
+      max: envInt('DATABASE_POOL_MAX', 3),
+      connectionTimeoutMillis: envInt('DATABASE_CONNECT_TIMEOUT_MS', 30_000),
+    }),
   });
 }
 

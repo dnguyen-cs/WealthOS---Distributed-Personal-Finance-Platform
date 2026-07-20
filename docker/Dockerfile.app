@@ -1,4 +1,5 @@
-# Dev-mode container; source is bind-mounted by docker-compose, node_modules stays in the image
+# Dev-mode container; source is bind-mounted by docker-compose, while
+# node_modules is kept in a container volume so host/Alpine binaries do not mix.
 FROM node:22-alpine
 
 WORKDIR /app
@@ -12,4 +13,4 @@ COPY . .
 RUN pnpm prisma generate
 
 EXPOSE 3000
-CMD ["pnpm", "dev"]
+CMD ["sh", "-lc", "pnpm install --frozen-lockfile --prefer-offline --force && pnpm prisma generate && pnpm dev"]

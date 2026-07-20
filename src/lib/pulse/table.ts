@@ -1,10 +1,10 @@
 import {
   CreateTableCommand,
-  DynamoDBClient,
   ResourceInUseException,
   UpdateTimeToLiveCommand,
 } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+
+import { dynamo } from '@/lib/dynamo';
 
 // Single-table layout for PortfolioPulse. One on-demand table holds market
 // data and coordination state; the generic pk/sk scheme keeps hot items
@@ -21,22 +21,9 @@ import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 // BAR sort keys are ISO timestamps so a Query with begins_with(sk, 'BAR#')
 // returns bars in time order.
 
-const globalForDynamo = globalThis as unknown as { pulseDynamo?: DynamoDBDocumentClient };
-
-function createClient(): DynamoDBDocumentClient {
-  const client = new DynamoDBClient({
-    region: process.env.AWS_REGION ?? 'us-east-1',
-    // Endpoint override points at LocalStack locally; unset on real AWS.
-    ...(process.env.DYNAMODB_ENDPOINT ? { endpoint: process.env.DYNAMODB_ENDPOINT } : {}),
-  });
-  return DynamoDBDocumentClient.from(client, {
-    marshallOptions: { removeUndefinedValues: true },
-  });
-}
-
-export const dynamo = globalForDynamo.pulseDynamo ?? createClient();
-
-if (process.env.NODE_ENV !== 'production') globalForDynamo.pulseDynamo = dynamo;
+// The document client is shared app-wide (lib/dynamo.ts); this module
+// keeps the pulse table's name, key layout, and local provisioning.
+export { dynamo } from '@/lib/dynamo';
 
 export function pulseTable(): string {
   return process.env.PULSE_TABLE ?? 'pulse';

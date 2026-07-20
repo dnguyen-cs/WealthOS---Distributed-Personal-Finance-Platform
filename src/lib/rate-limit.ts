@@ -1,45 +1,20 @@
-import { redis } from '@/lib/redis';
+import { addToCounterIfExists, bumpCounter } from '@/lib/app-state';
 
-// Redis-backed abuse guards for public endpoints. Both primitives are
-// single Lua scripts so concurrent requests cannot interleave between the
-// read and the write (same reasoning as the sync lock's token-guarded
-// release). Failure mode is fail-closed by design: if Redis is down the
-// caller should reject the request, because the guarded endpoints spend
-// real money (compute) or feed credential stuffing (auth) when unguarded.
-
-// Fixed-window counter. INCR creates the key at 1, and only that first
-// request sets the TTL, so the window cannot be extended by later hits.
-const FIXED_WINDOW = `
-local count = redis.call('INCR', KEYS[1])
-if count == 1 then
-  redis.call('EXPIRE', KEYS[1], ARGV[1])
-end
-return { count, redis.call('TTL', KEYS[1]) }
-`;
-
-// Daily budget. The increment and the limit check must be one atomic step:
-// two racing requests may both overshoot, and each rolls back only its own
-// contribution, so the counter never leaks upward on rejection.
-const CONSUME_BUDGET = `
-local total = redis.call('INCRBY', KEYS[1], ARGV[1])
-if total == tonumber(ARGV[1]) then
-  redis.call('EXPIRE', KEYS[1], ARGV[2])
-end
-if total > tonumber(ARGV[3]) then
-  redis.call('DECRBY', KEYS[1], ARGV[1])
-  return { 0, total - tonumber(ARGV[1]) }
-end
-return { 1, total }
-`;
-
-// Refund is conditional on the key still existing: after the daily key
-// expires, a late refund must not create a negative counter.
-const REFUND_BUDGET = `
-if redis.call('EXISTS', KEYS[1]) == 1 then
-  return redis.call('DECRBY', KEYS[1], ARGV[1])
-end
-return 0
-`;
+// DynamoDB-backed abuse guards for public endpoints (ported from Redis
+// when the hosted stack became Vercel + AWS only - ElastiCache is
+// VPC-bound and unreachable from Vercel). The conditional-write
+// primitives in lib/app-state.ts carry the atomicity the old Lua scripts
+// provided. Failure mode is fail-closed by design: if DynamoDB is down
+// the caller should reject the request, because the guarded endpoints
+// spend real money (compute) or feed credential stuffing (auth) when
+// unguarded.
+//
+// One honest semantic delta from the Lua version, documented in
+// MASTER.md 9.12: the budget check and its rollback are two atomic
+// writes rather than one script, so a racing request at the exact budget
+// boundary can observe a doomed contribution and be rejected
+// conservatively. The budget can never be exceeded; it can only round
+// down under contention.
 
 export interface RateLimitDecision {
   allowed: boolean;
@@ -52,12 +27,12 @@ export async function fixedWindowLimit(
   limit: number,
   windowSeconds: number,
 ): Promise<RateLimitDecision> {
-  const [count, ttl] = (await redis.eval(FIXED_WINDOW, 1, key, windowSeconds)) as [
-    number,
-    number,
-  ];
+  const { count, expiresAt } = await bumpCounter(key, 1, windowSeconds);
   if (count <= limit) return { allowed: true, retryAfterSeconds: 0 };
-  return { allowed: false, retryAfterSeconds: Math.max(ttl, 1) };
+  return {
+    allowed: false,
+    retryAfterSeconds: Math.max(expiresAt - Math.floor(Date.now() / 1000), 1),
+  };
 }
 
 export interface BudgetDecision {
@@ -66,6 +41,8 @@ export interface BudgetDecision {
   usedToday: number;
 }
 
+// The UTC day lives in the key, so a window rollover is a new item and
+// needs no reset race handling; the TTL just garbage-collects old days.
 const DAY_KEY_TTL_SECONDS = 48 * 60 * 60;
 
 function utcDay(): string {
@@ -81,17 +58,17 @@ export async function consumeDailyBudget(
   amount: number,
   budget: number,
 ): Promise<BudgetDecision> {
-  const [allowed, used] = (await redis.eval(
-    CONSUME_BUDGET,
-    1,
-    dailyBudgetKey(prefix),
-    amount,
-    DAY_KEY_TTL_SECONDS,
-    budget,
-  )) as [number, number];
-  return { allowed: allowed === 1, usedToday: used };
+  const key = dailyBudgetKey(prefix);
+  const { count: used } = await bumpCounter(key, amount, DAY_KEY_TTL_SECONDS);
+  if (used > budget) {
+    // Roll back only this call's contribution, so the counter never
+    // leaks upward on rejection even when two requests overshoot at once.
+    await addToCounterIfExists(key, -amount);
+    return { allowed: false, usedToday: used - amount };
+  }
+  return { allowed: true, usedToday: used };
 }
 
 export async function refundDailyBudget(prefix: string, amount: number): Promise<void> {
-  await redis.eval(REFUND_BUDGET, 1, dailyBudgetKey(prefix), amount);
+  await addToCounterIfExists(dailyBudgetKey(prefix), -amount);
 }

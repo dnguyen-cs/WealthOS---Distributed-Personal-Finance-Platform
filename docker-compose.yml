@@ -16,16 +16,6 @@ services:
       timeout: 3s
       retries: 10
 
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
   # Local SQS stand-in (dev-only emulator; AWS provides the real queue)
   queue:
     image: softwaremill/elasticmq-native:latest
@@ -83,7 +73,6 @@ services:
     environment:
       # override localhost from .env with in-network service hosts
       DATABASE_URL: postgresql://wealthos:wealthos@db:5432/wealthos
-      REDIS_URL: redis://redis:6379
       SQS_ENDPOINT: http://queue:9324
       WEALTHSIM_QUEUE_URL: http://queue:9324/000000000000/wealthsim-jobs
       WEALTHSIM_QUEUE_URL_GO: http://queue:9324/000000000000/wealthsim-jobs-go
@@ -93,8 +82,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      redis:
-        condition: service_healthy
+      table:
+        condition: service_started
     volumes:
       - .:/app
       - /app/node_modules

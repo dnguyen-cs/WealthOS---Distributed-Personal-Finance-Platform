@@ -24,8 +24,8 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         // Attempts are counted per IP, successes included: Auth.js can only
         // surface a generic failure from here, so the limit (20 per 15 min)
         // stays far above any legitimate use while still smothering
-        // credential stuffing. Fail closed - a Redis outage rejects logins
-        // rather than opening an unmetered guessing window.
+        // credential stuffing. Fail closed - a DynamoDB outage rejects
+        // logins rather than opening an unmetered guessing window.
         const attempts = await fixedWindowLimit(
           `rl:login:${clientIp(request)}`,
           20,

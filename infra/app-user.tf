@@ -42,6 +42,18 @@ data "aws_iam_policy_document" "wealthos_app" {
     resources = [aws_lambda_function.pulse["ingest"].arn]
   }
 
+  # The app owns the whole app-state table (rate-limit windows, budgets,
+  # sync locks) - full item CRUD, no partition scoping needed.
+  statement {
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:DeleteItem",
+    ]
+    resources = [aws_dynamodb_table.app_state.arn]
+  }
+
   statement {
     actions   = ["s3:GetObject"]
     resources = ["${aws_s3_bucket.wealthsim_results.arn}/jobs/*"]

@@ -11,7 +11,6 @@ jobs:
     env:
       # build-time placeholders; nothing connects during lint/typecheck/build
       DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
-      REDIS_URL: redis://localhost:6379
       AUTH_SECRET: ci-placeholder-secret
       PLAID_CLIENT_ID: ci
       PLAID_SECRET: ci

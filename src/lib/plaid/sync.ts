@@ -1,21 +1,16 @@
 import { randomUUID } from 'node:crypto';
 import type { Transaction as PlaidTransaction } from 'plaid';
+import { acquireLock, releaseLock } from '@/lib/app-state';
 import { decrypt } from '@/lib/crypto';
 import { prisma } from '@/lib/db/prisma';
 import { plaidClient } from '@/lib/plaid/client';
 import { upsertAccounts } from '@/lib/plaid/accounts';
-import { redis } from '@/lib/redis';
 
+// Lock semantics live in lib/app-state.ts: a DynamoDB conditional-write
+// lease with a holder token, so an expired lock taken over by another
+// sync is never released from under it (same invariant the old Redis
+// token-guarded Lua release enforced).
 const LOCK_TTL_SECONDS = 300;
-// release only if we still own the lock (token match), so an expired lock
-// taken over by another sync is never deleted from under it
-const RELEASE_LOCK = `
-if redis.call("get", KEYS[1]) == ARGV[1] then
-  return redis.call("del", KEYS[1])
-else
-  return 0
-end
-`;
 
 export class SyncLockedError extends Error {
   constructor() {
@@ -45,7 +40,7 @@ function transactionData(t: PlaidTransaction, accountId: string) {
 /**
  * Idempotent transaction sync for one PlaidItem.
  *
- * - A Redis NX lock per item prevents concurrent syncs from interleaving.
+ * - A per-item lock (DynamoDB conditional write) prevents concurrent syncs from interleaving.
  * - Each transactionsSync page is applied together with its cursor in one DB
  *   transaction, so a crash mid-sync resumes from the last committed page and
  *   re-running a completed sync is a no-op (upserts keyed on plaidTransactionId).
@@ -53,7 +48,7 @@ function transactionData(t: PlaidTransaction, accountId: string) {
 export async function syncPlaidItem(plaidItemDbId: string): Promise<SyncResult> {
   const lockKey = `plaid:sync:${plaidItemDbId}`;
   const lockToken = randomUUID();
-  const acquired = await redis.set(lockKey, lockToken, 'EX', LOCK_TTL_SECONDS, 'NX');
+  const acquired = await acquireLock(lockKey, lockToken, LOCK_TTL_SECONDS);
   if (!acquired) throw new SyncLockedError();
 
   try {
@@ -114,6 +109,6 @@ export async function syncPlaidItem(plaidItemDbId: string): Promise<SyncResult> 
 
     return totals;
   } finally {
-    await redis.eval(RELEASE_LOCK, 1, lockKey, lockToken);
+    await releaseLock(lockKey, lockToken);
   }
 }
