@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Bundled Lambda artifacts from `pnpm build:lambdas` (gitignored).
+    "dist/**",
   ]),
 ]);
 

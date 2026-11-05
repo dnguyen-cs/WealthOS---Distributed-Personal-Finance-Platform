@@ -1,0 +1,41 @@
+AWS Batch scaling benchmark: workers=[16,64] paths=[10000000,100000000] repeats=3
+
+=== fleet of 16 worker(s) ===
+fleet RUNNING after 48s
+16w 10M rep1: 15.9s wall, 630,360 paths/s, $0.0003/M paths
+16w 10M rep2: 21.6s wall, 462,918 paths/s, $0.0005/M paths
+16w 10M rep3: 21.6s wall, 463,316 paths/s, $0.0005/M paths
+@smithy/node-http-handler:WARN - socket usage at capacity=50 and 1492 additional requests are enqueued.
+See https://docs.aws.amazon.com/sdk-for-javascript/v3/developer-guide/node-configuring-maxsockets.html
+or increase socketAcquisitionWarningTimeout=(millis) in the NodeHttpHandler config.
+16w 100M rep1: 110.0s wall, 908,838 paths/s, $0.0002/M paths
+@smithy/node-http-handler:WARN - socket usage at capacity=50 and 1525 additional requests are enqueued.
+See https://docs.aws.amazon.com/sdk-for-javascript/v3/developer-guide/node-configuring-maxsockets.html
+or increase socketAcquisitionWarningTimeout=(millis) in the NodeHttpHandler config.
+16w 100M rep2: 101.7s wall, 982,999 paths/s, $0.0002/M paths
+@smithy/node-http-handler:WARN - socket usage at capacity=50 and 1476 additional requests are enqueued.
+See https://docs.aws.amazon.com/sdk-for-javascript/v3/developer-guide/node-configuring-maxsockets.html
+or increase socketAcquisitionWarningTimeout=(millis) in the NodeHttpHandler config.
+16w 100M rep3: 101.4s wall, 985,962 paths/s, $0.0002/M paths
+fleet of 16 terminated
+
+=== fleet of 64 worker(s) ===
+fleet RUNNING after 100s
+64w 10M rep1: 8.5s wall, 1,181,071 paths/s, $0.0007/M paths
+64w 10M rep2: 8.1s wall, 1,230,656 paths/s, $0.0007/M paths
+64w 10M rep3: 8.1s wall, 1,227,965 paths/s, $0.0007/M paths
+@smithy/node-http-handler:WARN - socket usage at capacity=50 and 1207 additional requests are enqueued.
+See https://docs.aws.amazon.com/sdk-for-javascript/v3/developer-guide/node-configuring-maxsockets.html
+or increase socketAcquisitionWarningTimeout=(millis) in the NodeHttpHandler config.
+64w 100M rep1: 33.0s wall, 3,029,601 paths/s, $0.0003/M paths
+@smithy/node-http-handler:WARN - socket usage at capacity=50 and 1202 additional requests are enqueued.
+See https://docs.aws.amazon.com/sdk-for-javascript/v3/developer-guide/node-configuring-maxsockets.html
+or increase socketAcquisitionWarningTimeout=(millis) in the NodeHttpHandler config.
+64w 100M rep2: 30.9s wall, 3,239,674 paths/s, $0.0003/M paths
+@smithy/node-http-handler:WARN - socket usage at capacity=50 and 1225 additional requests are enqueued.
+See https://docs.aws.amazon.com/sdk-for-javascript/v3/developer-guide/node-configuring-maxsockets.html
+or increase socketAcquisitionWarningTimeout=(millis) in the NodeHttpHandler config.
+64w 100M rep3: 31.6s wall, 3,161,877 paths/s, $0.0003/M paths
+fleet of 64 terminated
+
+done; results in bench-results/aws.jsonl
