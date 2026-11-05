@@ -1,16 +1,19 @@
 # PortfolioPulse streaming plane. Deliberate exclusions, per the $0-idle
-# rule: the Kinesis stream and the consumer's event source mapping are NOT
-# managed here - a provisioned shard and an active mapping bill hourly, so
-# the ingest Lambda creates both lazily on the first "Go live" of the day
-# and the janitor deletes them after idle hours (SDK lifecycle, IAM'd
-# below). Terraform owns everything durable-and-free: the table, the three
-# functions, their roles, the DLQ, the alarm, and the janitor schedule.
+# rule: the Kinesis stream, its enhanced fan-out consumer, and the
+# consumer's event source mapping are NOT managed here - a provisioned
+# shard and a fan-out consumer bill hourly, so the ingest Lambda creates
+# them lazily on the first "Go live" of the day and the janitor deletes
+# them after idle hours (SDK lifecycle, IAM'd below). Terraform owns
+# everything durable-and-free: the table, the three functions, their
+# roles, the DLQ, the alarm, and the janitor schedule.
 #
 # Artifacts come from `pnpm build:lambdas` (dist/lambda/pulse-*.zip).
 
 locals {
   pulse_stream_name = "pulse-events"
   pulse_stream_arn  = "arn:aws:kinesis:us-east-1:${data.aws_caller_identity.current.account_id}:stream/${local.pulse_stream_name}"
+  # Enhanced fan-out consumers: <stream ARN>/consumer/<name>:<creation timestamp>.
+  pulse_consumer_arns = "${local.pulse_stream_arn}/consumer/*"
 
   pulse_functions = {
     ingest = {
@@ -114,8 +117,15 @@ data "aws_iam_policy_document" "pulse_ingest" {
       "kinesis:CreateStream",
       "kinesis:DescribeStreamSummary",
       "kinesis:PutRecords",
+      "kinesis:RegisterStreamConsumer",
     ]
     resources = [local.pulse_stream_arn]
+  }
+
+  # Wait for the fan-out consumer to turn ACTIVE before mapping onto it.
+  statement {
+    actions   = ["kinesis:DescribeStreamConsumer"]
+    resources = [local.pulse_stream_arn, local.pulse_consumer_arns]
   }
 
   statement {
@@ -165,6 +175,13 @@ data "aws_iam_policy_document" "pulse_consumer" {
     resources = [local.pulse_stream_arn]
   }
 
+  # Enhanced fan-out: the mapping holds a SubscribeToShard push connection
+  # on the stream's registered consumer, as this role.
+  statement {
+    actions   = ["kinesis:SubscribeToShard", "kinesis:DescribeStreamConsumer"]
+    resources = [local.pulse_consumer_arns]
+  }
+
   statement {
     actions = [
       "dynamodb:GetItem",
@@ -186,11 +203,17 @@ data "aws_iam_policy_document" "pulse_consumer" {
   }
 }
 
-# Janitor: inspect activity, then delete the mapping and the stream.
+# Janitor: inspect activity, then delete the mapping, the fan-out
+# consumer, and the stream.
 data "aws_iam_policy_document" "pulse_janitor" {
   statement {
     actions   = ["kinesis:DescribeStreamSummary", "kinesis:DeleteStream"]
     resources = [local.pulse_stream_arn]
+  }
+
+  statement {
+    actions   = ["kinesis:DeregisterStreamConsumer"]
+    resources = [local.pulse_stream_arn, local.pulse_consumer_arns]
   }
 
   statement {

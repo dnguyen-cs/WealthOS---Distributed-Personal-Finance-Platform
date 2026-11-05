@@ -78,6 +78,8 @@ export const sessionStateSchema = z.object({
   /** ms epoch; the ingest lease is dead past this point. */
   leaseUntil: z.number().int().nonnegative(),
   startedAt: z.number().int().nonnegative().optional(),
+  /** The last viewer asked this session to stop; the ingest exits within seconds. */
+  stopRequested: z.boolean().optional(),
 });
 
 export type SessionState = z.infer<typeof sessionStateSchema>;

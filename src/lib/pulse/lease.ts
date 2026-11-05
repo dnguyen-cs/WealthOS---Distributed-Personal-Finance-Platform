@@ -1,5 +1,11 @@
 import { ConditionalCheckFailedException } from '@aws-sdk/client-dynamodb';
-import { DeleteCommand, GetCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import {
+  DeleteCommand,
+  GetCommand,
+  PutCommand,
+  QueryCommand,
+  UpdateCommand,
+} from '@aws-sdk/lib-dynamodb';
 
 import { dynamo, keys, pulseTable } from '@/lib/pulse/table';
 import { sessionStateSchema, type SessionState } from '@/lib/pulse/types';
@@ -87,35 +93,123 @@ export async function releaseSessionLease(sessionId: string): Promise<void> {
 
 /** Current session as the outside world should see it (expired = idle). */
 export async function readSessionState(): Promise<SessionState | null> {
-  const result = await dynamo.send(
-    new GetCommand({ TableName: pulseTable(), Key: keys.sessionState() }),
-  );
+  const [result, stop] = await Promise.all([
+    dynamo.send(new GetCommand({ TableName: pulseTable(), Key: keys.sessionState() })),
+    dynamo.send(new GetCommand({ TableName: pulseTable(), Key: keys.stop() })),
+  ]);
   if (!result.Item) return null;
   const state = sessionStateSchema.parse({
     status: result.Item.status,
     sessionId: result.Item.sessionId,
     leaseUntil: result.Item.leaseUntil,
     ...(result.Item.startedAt !== undefined ? { startedAt: result.Item.startedAt } : {}),
+    stopRequested: stop.Item?.sessionId === result.Item.sessionId && stop.Item?.stop === true,
   });
   return state.leaseUntil < Date.now() ? null : state;
 }
 
-const VIEWER_WINDOW_MS = 2 * 60 * 1000;
+// Stopping. The STATE item stays ingest-owned (only the lease holder
+// writes it); a stop is a separate SESSION/STOP control item that the
+// app writes and the ingest polls every couple of seconds. It names the
+// session it targets, so a stale request can never stop a later session,
+// and a "Go live" that lands before the ingest acts overwrites it with
+// stop=false. Plain Puts in the SESSION partition, so the app needs no
+// write access beyond what the viewer keepalive already has.
 
-// Viewer keepalive: the dashboard's poll route touches this item; the
-// ingest exits when nobody has polled inside the window, which is what
-// makes sessions cost nothing once the audience leaves.
-export async function touchViewers(): Promise<void> {
+const STOP_TTL_SECONDS = 60 * 60;
+
+async function writeStop(sessionId: string, stop: boolean): Promise<void> {
   await dynamo.send(
     new PutCommand({
       TableName: pulseTable(),
       Item: {
-        ...keys.viewers(),
-        lastSeenAt: Date.now(),
-        expiresAt: Math.floor(Date.now() / 1000) + 3600,
+        ...keys.stop(),
+        sessionId,
+        stop,
+        at: Date.now(),
+        expiresAt: Math.floor(Date.now() / 1000) + STOP_TTL_SECONDS,
       },
     }),
   );
+}
+
+export function requestStop(sessionId: string): Promise<void> {
+  return writeStop(sessionId, true);
+}
+
+export function cancelStop(sessionId: string): Promise<void> {
+  return writeStop(sessionId, false);
+}
+
+/** Ingest side: has a viewer asked this exact session to stop? */
+export async function stopRequestedFor(sessionId: string): Promise<boolean> {
+  const result = await dynamo.send(
+    new GetCommand({ TableName: pulseTable(), Key: keys.stop(), ConsistentRead: true }),
+  );
+  return result.Item?.sessionId === sessionId && result.Item?.stop === true;
+}
+
+const VIEWER_WINDOW_MS = 2 * 60 * 1000;
+// A watching tile polls every 1.5s, so anyone silent for 30s has left;
+// that is the bar for "someone else is still watching" when a viewer
+// presses Stop.
+const ACTIVE_VIEWER_MS = 30_000;
+const VIEWER_TTL_SECONDS = 60 * 60;
+
+// Viewer keepalive, two items per touch. VIEWERS is the single
+// any-viewer heartbeat the ingest checks (one cheap GetItem; the ingest
+// role cannot Query): it exits once nobody has polled inside the window,
+// which is what makes sessions cost nothing once the audience leaves.
+// VIEWER#<userId> is per-user presence, read only when someone presses
+// Stop, so one viewer leaving never cuts off another who is still watching.
+export async function touchViewer(userId: string): Promise<void> {
+  const now = Date.now();
+  const expiresAt = Math.floor(now / 1000) + VIEWER_TTL_SECONDS;
+  await Promise.all([
+    dynamo.send(
+      new PutCommand({
+        TableName: pulseTable(),
+        Item: { ...keys.viewers(), lastSeenAt: now, expiresAt },
+      }),
+    ),
+    dynamo.send(
+      new PutCommand({
+        TableName: pulseTable(),
+        Item: { ...keys.viewer(userId), lastSeenAt: now, expiresAt },
+      }),
+    ),
+  ]);
+}
+
+/** Marks the user as gone (a Put, not a Delete: the app has no DeleteItem grant). */
+export async function leaveViewer(userId: string): Promise<void> {
+  await dynamo.send(
+    new PutCommand({
+      TableName: pulseTable(),
+      Item: {
+        ...keys.viewer(userId),
+        leftAt: Date.now(),
+        expiresAt: Math.floor(Date.now() / 1000) + VIEWER_TTL_SECONDS,
+      },
+    }),
+  );
+}
+
+/** How many users other than `userId` are actively watching right now. */
+export async function otherActiveViewers(userId: string): Promise<number> {
+  const result = await dynamo.send(
+    new QueryCommand({
+      TableName: pulseTable(),
+      KeyConditionExpression: 'pk = :pk AND begins_with(sk, :viewer)',
+      ExpressionAttributeValues: { ':pk': keys.viewers().pk, ':viewer': 'VIEWER#' },
+      ConsistentRead: true,
+    }),
+  );
+  const self = keys.viewer(userId).sk;
+  const cutoff = Date.now() - ACTIVE_VIEWER_MS;
+  return (result.Items ?? []).filter(
+    (item) => item.sk !== self && typeof item.lastSeenAt === 'number' && item.lastSeenAt > cutoff,
+  ).length;
 }
 
 export async function viewersActive(): Promise<boolean> {

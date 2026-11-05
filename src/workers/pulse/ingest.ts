@@ -1,10 +1,11 @@
 // PortfolioPulse ingest, Lambda edition: one invocation = one live-data
 // session (up to ~14.5 min inside the 15-min Lambda cap). Started by the
 // dashboard's "Go live"; single-flight via the DynamoDB lease; exits when
-// viewers stop polling, the wall clock runs out, the source goes quiet,
-// or the lease is lost to a takeover. The stream and the consumer's event
-// source mapping are provisioned lazily here (and torn down by the
-// janitor) because both bill by the hour whether or not events flow.
+// the last viewer presses Stop, viewers stop polling, the wall clock runs
+// out, the source goes quiet, or the lease is lost to a takeover. The
+// stream and the consumer's event source mapping are provisioned lazily
+// here (and torn down by the janitor) because both bill by the hour
+// whether or not events flow.
 import { randomUUID } from 'node:crypto';
 
 import { PutRecordsCommand } from '@aws-sdk/client-kinesis';
@@ -14,6 +15,7 @@ import {
   HEARTBEAT_MS,
   releaseSessionLease,
   renewSessionLease,
+  stopRequestedFor,
   viewersActive,
 } from '@/lib/pulse/lease';
 import {
@@ -36,6 +38,10 @@ function envInt(name: string, fallback: number): number {
 const EVENTS_PER_RECORD = () => envInt('PULSE_EVENTS_PER_RECORD', 100);
 const FLUSH_INTERVAL_MS = 200;
 const PUT_BATCH_LIMIT = 500;
+// How often the session checks for a Stop: one consistent GetItem every
+// 2s (~435 reads over a full session) buys a Stop that lands in seconds
+// instead of waiting out the 30s heartbeat.
+const STOP_CHECK_MS = 2_000;
 
 export class RecordBatcher {
   private buffers = new Map<string, PulseEvent[]>();
@@ -115,6 +121,7 @@ export async function runIngestSession(): Promise<IngestOutcome> {
 
   const maxSessionMs = envInt('PULSE_SESSION_MAX_MS', 870_000);
   const heartbeatMs = envInt('PULSE_HEARTBEAT_MS', HEARTBEAT_MS);
+  const stopCheckMs = Math.min(envInt('PULSE_STOP_CHECK_MS', STOP_CHECK_MS), heartbeatMs);
   const ignoreViewers = process.env.PULSE_IGNORE_VIEWERS === '1';
   const batcher = new RecordBatcher();
   const source = selectSource();
@@ -125,6 +132,12 @@ export async function runIngestSession(): Promise<IngestOutcome> {
   try {
     await ensureStreamActive(envInt('PULSE_SHARDS', 1));
     await ensureConsumerMapping();
+    // A cold start can take over a minute; Stop pressed meanwhile ends the
+    // session here instead of after it connects and briefly goes live.
+    if (await stopRequestedFor(sessionId)) {
+      console.log('stop requested during startup, exiting');
+      return 'ran';
+    }
 
     await source.start([...PULSE_SYMBOLS], (event) => {
       lastEventAt = Date.now();
@@ -140,8 +153,15 @@ export async function runIngestSession(): Promise<IngestOutcome> {
       });
     }, FLUSH_INTERVAL_MS);
 
+    let nextHeartbeatAt = Date.now() + heartbeatMs;
     for (;;) {
-      await new Promise((resolve) => setTimeout(resolve, heartbeatMs));
+      await new Promise((resolve) => setTimeout(resolve, stopCheckMs));
+      if (await stopRequestedFor(sessionId)) {
+        console.log('stop requested by the last viewer, exiting');
+        break;
+      }
+      if (Date.now() < nextHeartbeatAt) continue;
+      nextHeartbeatAt = Date.now() + heartbeatMs;
       if (Date.now() - startedAt >= maxSessionMs) {
         console.log('session wall clock reached, exiting');
         break;

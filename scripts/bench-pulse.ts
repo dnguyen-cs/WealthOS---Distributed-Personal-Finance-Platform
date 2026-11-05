@@ -7,7 +7,10 @@
 //
 //   AWS_REGION=us-east-1 MODE=latency pnpm exec tsx scripts/bench-pulse.ts
 //   MODE=latency     steady rates, sampling the consumer's stats item;
-//                    then re-checks one rate with the batching window at 0s
+//                    then re-checks one rate with the other batching window
+//                    (0s vs 1s). The mapping is enhanced fan-out unless
+//                    PULSE_ENHANCED_FAN_OUT=0 when it is first created; an
+//                    existing mapping is kept, so run MODE=cleanup to switch
 //   MODE=throughput  30s max-rate bursts to find the per-shard PutRecords
 //                    ceiling at 1/10/100 events packed per record
 //   MODE=drain       builds a backlog with the mapping disabled, re-enables,
@@ -230,7 +233,11 @@ async function throughputMode() {
   }
 }
 
-async function runLatencyLevel(eventsPerSec: number, batchWindowSeconds: number) {
+async function runLatencyLevel(
+  eventsPerSec: number,
+  batchWindowSeconds: number,
+  fanOut: boolean,
+) {
   const eventsPerRecord = Math.max(1, Math.min(100, Math.round(eventsPerSec / 50)));
   const recordsPerTick = Math.max(1, Math.round(eventsPerSec / eventsPerRecord / 5));
   const samples: { p50: number; p99: number }[] = [];
@@ -271,6 +278,7 @@ async function runLatencyLevel(eventsPerSec: number, batchWindowSeconds: number)
     targetEventsPerSec: eventsPerSec,
     achievedEventsPerSec: Math.round((put.accepted * eventsPerRecord) / producerSeconds),
     eventsPerRecord,
+    fanOut,
     batchWindowSeconds,
     batches: samples.length,
     medianP50Ms: Math.round(median(p50s)),
@@ -280,7 +288,8 @@ async function runLatencyLevel(eventsPerSec: number, batchWindowSeconds: number)
   };
   record(entry);
   console.log(
-    `rate=${String(eventsPerSec).padStart(4)} ev/s (window ${batchWindowSeconds}s): ` +
+    `rate=${String(eventsPerSec).padStart(4)} ev/s ` +
+      `(${fanOut ? 'fan-out' : 'standard'}, window ${batchWindowSeconds}s): ` +
       `${entry.batches} batches sampled, median p50 ${entry.medianP50Ms}ms, ` +
       `median p99 ${entry.medianP99Ms}ms, worst p99 ${entry.worstP99Ms}ms`,
   );
@@ -289,17 +298,26 @@ async function runLatencyLevel(eventsPerSec: number, batchWindowSeconds: number)
 async function latencyMode() {
   await ensureStreamActive();
   await ensureConsumerMapping();
-  console.log('MODE=latency: steady rates, sampling the consumer stats item');
+  // Label results by the mapping that actually exists: a stream mapped
+  // before fan-out keeps its standard mapping until a cleanup.
+  const mapping = await getMapping();
+  const fanOut = mapping.EventSourceArn?.includes('/consumer/') ?? false;
+  const productionWindow = mapping.MaximumBatchingWindowInSeconds ?? (fanOut ? 0 : 1);
+  const otherWindow = productionWindow === 0 ? 1 : 0;
+  console.log(
+    `MODE=latency: steady rates through a ${fanOut ? 'fan-out' : 'standard'} mapping, ` +
+      'sampling the consumer stats item',
+  );
   console.log('settling consumer (ESM warmup / prior backlog)...');
   await settleConsumer();
   for (const eventsPerSec of [100, 1000, 5000]) {
-    await runLatencyLevel(eventsPerSec, 1);
+    await runLatencyLevel(eventsPerSec, productionWindow, fanOut);
   }
-  console.log('re-checking 1000 ev/s with the batching window at 0s');
-  await setBatchWindow(0);
+  console.log(`re-checking 1000 ev/s with the batching window at ${otherWindow}s`);
+  await setBatchWindow(otherWindow);
   await settleConsumer();
-  await runLatencyLevel(1000, 0);
-  await setBatchWindow(1); // restore the production setting
+  await runLatencyLevel(1000, otherWindow, fanOut);
+  await setBatchWindow(productionWindow); // restore the production setting
 }
 
 async function drainMode() {

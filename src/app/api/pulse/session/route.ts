@@ -3,7 +3,14 @@ import { NextResponse } from 'next/server';
 import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 
 import { auth } from '@/lib/auth';
-import { readSessionState, touchViewers } from '@/lib/pulse/lease';
+import {
+  cancelStop,
+  leaveViewer,
+  otherActiveViewers,
+  readSessionState,
+  requestStop,
+  touchViewer,
+} from '@/lib/pulse/lease';
 import { ensureLocalPulseTable } from '@/lib/pulse/table';
 import { fixedWindowLimit } from '@/lib/rate-limit';
 
@@ -42,9 +49,12 @@ export async function POST() {
 
   try {
     await ensureLocalPulseTable(); // no-op on AWS
-    await touchViewers();
+    await touchViewer(session.user.id);
 
     const current = await readSessionState();
+    // Joining a session that is winding down revokes the stop, so a viewer
+    // who arrives in that window keeps it instead of watching it die.
+    if (current?.stopRequested) await cancelStop(current.sessionId);
     const ingestFunction = process.env.PULSE_INGEST_FUNCTION;
     if (!current && ingestFunction) {
       await lambdaClient.send(
@@ -53,11 +63,39 @@ export async function POST() {
     }
 
     return NextResponse.json({
-      session: current ?? { status: 'starting' },
+      session: current ? { ...current, stopRequested: false } : { status: 'starting' },
       managed: Boolean(ingestFunction),
     });
   } catch (error) {
     console.error('pulse session start failed', error);
     return NextResponse.json({ error: 'Failed to start session' }, { status: 502 });
+  }
+}
+
+// "Stop": the caller stops watching. The shared session ends only when
+// nobody else is actively watching, so one viewer can never cut off
+// another; otherwise it keeps running for them and still scales to zero
+// once they leave. Cheap and only ever reduces cost, so no rate limit.
+export async function DELETE() {
+  const session = await auth();
+  if (!session?.user?.id) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  try {
+    await ensureLocalPulseTable(); // no-op on AWS
+    await leaveViewer(session.user.id);
+    const [current, otherViewers] = await Promise.all([
+      readSessionState(),
+      otherActiveViewers(session.user.id),
+    ]);
+    if (!current || otherViewers > 0) {
+      return NextResponse.json({ stopping: false, otherViewers });
+    }
+    await requestStop(current.sessionId);
+    return NextResponse.json({ stopping: true, otherViewers: 0 });
+  } catch (error) {
+    console.error('pulse session stop failed', error);
+    return NextResponse.json({ error: 'Failed to stop session' }, { status: 502 });
   }
 }

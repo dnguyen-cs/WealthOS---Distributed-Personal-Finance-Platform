@@ -14,7 +14,9 @@ import { dynamo } from '@/lib/dynamo';
 //   SYM#<symbol>       LATEST           latest quote (PulseQuote)
 //   SYM#<symbol>       BAR#<isoMinute>  1-min OHLCV bar (+expiresAt TTL)
 //   SESSION            STATE            ingest lease + status (SessionState)
-//   SESSION            VIEWERS          viewer keepalive {lastSeenAt} (+TTL)
+//   SESSION            VIEWERS          any-viewer keepalive {lastSeenAt} (+TTL)
+//   SESSION            VIEWER#<userId>  per-user presence {lastSeenAt | leftAt} (+TTL)
+//   SESSION            STOP             stop request {sessionId, stop} (+TTL)
 //   SHARD#<shardId>    CHECKPOINT       consumer's last applied sequence number
 //   STATS              LATEST           rolling pipeline stats (+TTL)
 //
@@ -42,6 +44,8 @@ export const keys = {
   }),
   sessionState: (): PulseKey => ({ pk: 'SESSION', sk: 'STATE' }),
   viewers: (): PulseKey => ({ pk: 'SESSION', sk: 'VIEWERS' }),
+  viewer: (userId: string): PulseKey => ({ pk: 'SESSION', sk: `VIEWER#${userId}` }),
+  stop: (): PulseKey => ({ pk: 'SESSION', sk: 'STOP' }),
   checkpoint: (shardId: string): PulseKey => ({ pk: `SHARD#${shardId}`, sk: 'CHECKPOINT' }),
   stats: (): PulseKey => ({ pk: 'STATS', sk: 'LATEST' }),
 };

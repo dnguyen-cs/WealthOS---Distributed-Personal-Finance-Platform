@@ -169,10 +169,11 @@ The app then points `WEALTHSIM_QUEUE_URL`/`WEALTHSIM_QUEUE_URL_GO`/`WEALTHSIM_BU
 ```
 Coinbase WS (matches: BTC/ETH/SOL-USD)
   -> pulse-ingest Lambda    one session at a time (DynamoDB conditional-write lease),
-     |                      started by "Go live", exits when viewers stop polling
+     |                      started by "Go live", exits on Stop or when viewers stop polling
      |  PutRecords, partition key = symbol, N events packed per record
   -> Kinesis pulse-events   1 shard; created lazily, deleted by a daily janitor after idle hours
-  -> pulse-consumer Lambda  (event source mapping; parallelization 1 = one writer per shard)
+  -> pulse-consumer Lambda  (enhanced fan-out mapping, records pushed over HTTP/2;
+     |                      parallelization 1 = one writer per shard)
      |  per-shard sequence checkpoint committed atomically WITH the data (TransactWriteItems)
   -> DynamoDB pulse table   latest quotes + 1-min OHLCV bars + session state (TTL'd)
   -> GET /api/pulse         dashboard tile polls 1-2s; polling doubles as the viewer keepalive
@@ -180,23 +181,27 @@ Coinbase WS (matches: BTC/ETH/SOL-USD)
 
 Design decisions, and why:
 
-- **Sessions, not servers.** The one component a streaming pipeline can't scale to zero is the thing holding the websocket - so it runs as an on-demand Lambda session (up to ~15 min, renewed interest = new session) guarded by a DynamoDB lease: N users clicking "Go live" resolve to exactly one ingest, and a crashed session's lease expires by TTL. Idle days cost $0 because the janitor also deletes the Kinesis stream and event source mapping (both bill hourly whether or not events flow).
+- **Sessions, not servers.** The one component a streaming pipeline can't scale to zero is the thing holding the websocket - so it runs as an on-demand Lambda session (up to ~15 min, renewed interest = new session) guarded by a DynamoDB lease: N users clicking "Go live" resolve to exactly one ingest, and a crashed session's lease expires by TTL. Idle days cost $0 because the janitor also deletes the Kinesis stream, its fan-out consumer, and the event source mapping (the stream and the consumer bill hourly whether or not events flow). Pressing Stop ends the session within about 2s once nobody else is watching; otherwise it keeps running for the remaining viewers.
 - **Bars merge in any order.** Open/close are chosen by exchange timestamps (not arrival order), high/low by max/min, volume by addition - OHLCV bars form a commutative monoid, the same mergeable-statistics discipline as WealthSim's histograms. Replays and reorderings cannot scramble a price.
 - **Exactly-once on top of at-least-once.** The consumer keeps a per-shard sequence-number checkpoint and commits it in the same DynamoDB transaction as the bars it covers: a replayed batch is filtered before it can double-count volume. (The residual hole - a producer retry whose reported failure actually landed - is bounded and documented, not hidden.)
+- **Push, not poll.** A standard Kinesis mapping polls each shard about once per second, so an event waited ~0.5s on average before the consumer saw it, which set the floor under the old ~700ms p50.
+  The consumer now reads through a registered enhanced fan-out consumer that pushes records over HTTP/2 as they land, with no batching window; the ingest's 200ms flush is the remaining batching step.
+  It cut live p50 from 694ms to 167ms for about $0.015/hour of stream-consumer time plus more frequent, smaller consumer writes (costed below); `PULSE_ENHANCED_FAN_OUT=0` restores polling for an A/B run.
 - **Two latency segments, reported separately.** exchange->ingest includes the exchange's pipeline and clock skew; ingest->DynamoDB-write is the segment this system controls and the p50/p99 the tile displays.
 - **Local/cloud parity again.** kinesis-mock and dynamodb-local in compose behind the same endpoint-override pattern as ElasticMQ/MinIO; `scripts/pulse-ingest-local.ts` and `scripts/pulse-consumer-local.ts` are the local dev loop (a synthetic source generates load without touching the internet).
 
-Measured on the live plane (`scripts/bench-pulse.ts`; raw runs in `bench-results/pulse.jsonl`):
+Measured on the live plane (synthetic load via `scripts/bench-pulse.ts`, raw runs in `bench-results/pulse.jsonl`; live sessions sampled from the consumer's own stats, raw summary in `bench-results/pulse-live.jsonl`):
 
 | What | Number |
 |---|---|
 | Per-shard ceiling, naive (1 event/record) | ~1,386 events/s (records/s-bound) |
 | Per-shard ceiling, packed (10-100 events/record) | ~10,000 events/s (byte-bound) - x7.2 from record aggregation |
-| Pipeline p50, 100 -> 5,000 ev/s synthetic load | 806ms -> 889ms (50x load, +10% latency: batching-dominated) |
-| Live Coinbase session (single clock domain) | p50 694ms / p99 991ms |
+| Pipeline p50, 100 -> 5,000 ev/s synthetic load (standard polling) | 806ms -> 889ms (50x load, +10% latency: batching-dominated) |
+| Live Coinbase session, enhanced fan-out (single clock domain, 651 trades) | p50 167ms / p90 256ms / p99 304ms, worst 351ms |
+| Live Coinbase session, standard polling | p50 694ms / p99 991ms |
 | 100K-event backlog after an outage | drained in 1.5s (~67K ev/s - intake-bound recovery, 6.7x the shard ceiling) |
-| Cold "Go live" -> first data | 72s (lazy stream + first ESM creation) vs 3s warm |
-| Cost | ~$0.001 per million events sustained; ~$0.10 per live demo-hour; streaming plane $0 idle after janitor teardown (separate from the hosted deployment's Aurora and public-IPv4 floor noted above) |
+| Cold "Go live" -> first data | ~90s with fan-out (stream, consumer, and mapping creation; the new mapping's first delivery took 78s and replayed the queued trades); 72s cold / 3s warm with standard polling |
+| Cost | ~$0.001 per million events sustained; ~$0.16 per live demo-hour with fan-out (~$0.11 polling; the difference is the consumer-hour plus ~2.8 consumer invocations/s instead of 1/s); stream plus fan-out consumer ~$0.03/hour until the daily janitor tears them down, then $0 idle (separate from the hosted deployment's Aurora and public-IPv4 floor noted above) |
 
 ## Design notes (Phase 2)
 

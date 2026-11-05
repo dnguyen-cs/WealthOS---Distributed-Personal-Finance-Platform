@@ -8,7 +8,9 @@ import type { PulseBar } from '@/lib/pulse/types';
 // PortfolioPulse dashboard tile: live crypto quotes with 1-minute
 // sparklines, session controls, and the pipeline latency readout.
 // Polling doubles as the viewer keepalive (the API touches the VIEWERS
-// item), so an open dashboard is what keeps a session alive.
+// item), so an open dashboard is what keeps a session alive. Stop opts
+// this tile out of the keepalive and ends the session if nobody else is
+// watching.
 
 const LIVE_POLL_MS = 1_500;
 const IDLE_POLL_MS = 8_000;
@@ -111,18 +113,34 @@ function symbolPoints(bars: PulseBar[], latestPrice: number | null, latestTs: nu
   return points;
 }
 
+
 export function PulseTile() {
   const [snapshot, setSnapshot] = useState<PulseSnapshot | null>(null);
   const [snapshotAt, setSnapshotAt] = useState<number | null>(null);
   const [starting, setStarting] = useState(false);
+  // Watching = this tile's polls carry the keepalive that holds the shared
+  // session open. An open dashboard joins a running session by default;
+  // Stop opts this tile out until the next Go live.
+  const [watching, setWatching] = useState(true);
+  const [stoppingSessionId, setStoppingSessionId] = useState<string | null>(null);
+  const [othersWatching, setOthersWatching] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const startingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const live = snapshot?.session?.status === 'live';
-  const sessionStatus = snapshot?.session?.status ?? 'idle';
+  const session = snapshot?.session ?? null;
+  const live = session?.status === 'live';
+  const sessionStatus = session?.status ?? 'idle';
+  // Derived from the session itself, so it clears the moment the ingest
+  // exits and the lease disappears.
+  const winding =
+    session !== null &&
+    (session.stopRequested === true || stoppingSessionId === session.sessionId);
+  const fastPoll =
+    starting || winding || (watching && (live || sessionStatus === 'starting'));
 
   const poll = useCallback(async () => {
     try {
-      const response = await fetch('/api/pulse');
+      const response = await fetch(watching ? '/api/pulse' : '/api/pulse?keepalive=0');
       if (!response.ok) throw new Error(`status ${response.status}`);
       setSnapshot((await response.json()) as PulseSnapshot);
       setSnapshotAt(Date.now());
@@ -130,7 +148,7 @@ export function PulseTile() {
     } catch {
       setError('Pulse data unavailable.');
     }
-  }, []);
+  }, [watching]);
 
   useEffect(() => {
     let cancelled = false;
@@ -138,7 +156,7 @@ export function PulseTile() {
     async function tick() {
       await poll();
       if (!cancelled) {
-        timer = setTimeout(tick, live || starting ? LIVE_POLL_MS : IDLE_POLL_MS);
+        timer = setTimeout(tick, fastPoll ? LIVE_POLL_MS : IDLE_POLL_MS);
       }
     }
     tick();
@@ -146,9 +164,18 @@ export function PulseTile() {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [poll, live, starting]);
+  }, [poll, fastPoll]);
+
+  useEffect(
+    () => () => {
+      if (startingTimer.current) clearTimeout(startingTimer.current);
+    },
+    [],
+  );
 
   async function goLive() {
+    setWatching(true);
+    setStoppingSessionId(null);
     setStarting(true);
     setError(null);
     try {
@@ -164,15 +191,36 @@ export function PulseTile() {
       setError(startError instanceof Error ? startError.message : 'Failed to start session.');
     } finally {
       // stay in "starting" polling cadence; the snapshot flips us to live
-      setTimeout(() => setStarting(false), 15_000);
+      if (startingTimer.current) clearTimeout(startingTimer.current);
+      startingTimer.current = setTimeout(() => setStarting(false), 15_000);
+    }
+  }
+
+  async function stopLive() {
+    if (!session) return;
+    // Opt out first: even if the request below fails, this tile no longer
+    // holds the session open, so it still ends on its own within minutes.
+    setWatching(false);
+    setStarting(false);
+    if (startingTimer.current) clearTimeout(startingTimer.current);
+    setError(null);
+    try {
+      const response = await fetch('/api/pulse/session', { method: 'DELETE' });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error ?? 'Failed to stop session.');
+      if (data.stopping) setStoppingSessionId(session.sessionId);
+      setOthersWatching(typeof data.otherViewers === 'number' ? data.otherViewers : 0);
+    } catch {
+      setOthersWatching(0);
+      setError("Couldn't stop the stream right away; it ends on its own within about 2 minutes.");
     }
   }
 
   // Elapsed is derived from the poll timestamp, not a render-time clock:
   // it advances with each poll, which is exactly the tile's refresh rate.
   const elapsedSeconds =
-    live && snapshot?.session?.startedAt && snapshotAt !== null
-      ? Math.max(0, Math.round((snapshotAt - snapshot.session.startedAt) / 1000))
+    live && session?.startedAt && snapshotAt !== null
+      ? Math.max(0, Math.round((snapshotAt - session.startedAt) / 1000))
       : null;
 
   return (
@@ -180,7 +228,9 @@ export function PulseTile() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
           <h2 className="text-lg font-medium">PortfolioPulse</h2>
-          {live ? (
+          {winding ? (
+            <span className="text-xs opacity-60">stopping…</span>
+          ) : live ? (
             <span className="flex items-center gap-1.5 rounded-full border border-emerald-600/40 bg-emerald-600/10 px-2.5 py-0.5 text-xs font-medium text-emerald-700 dark:text-emerald-400">
               <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-current" />
               LIVE{elapsedSeconds !== null ? ` · ${Math.floor(elapsedSeconds / 60)}:${String(elapsedSeconds % 60).padStart(2, '0')}` : ''}
@@ -189,7 +239,15 @@ export function PulseTile() {
             <span className="text-xs opacity-60">starting session…</span>
           ) : null}
         </div>
-        {!live && sessionStatus !== 'starting' && (
+        {winding ? null : session && watching ? (
+          <button
+            type="button"
+            onClick={stopLive}
+            className="rounded-md border border-black/15 px-3 py-1.5 text-sm font-medium transition-colors hover:bg-black/5 dark:border-white/20 dark:hover:bg-white/5"
+          >
+            Stop
+          </button>
+        ) : (
           <button
             type="button"
             onClick={goLive}
@@ -206,6 +264,15 @@ export function PulseTile() {
       </p>
 
       {error && <p className="mt-3 text-sm text-red-600 dark:text-red-400">{error}</p>}
+
+      {session && !watching && !winding && othersWatching > 0 && (
+        <p className="mt-3 text-sm opacity-60">
+          You stopped watching.{' '}
+          {othersWatching === 1 ? 'Another viewer is' : `${othersWatching} other viewers are`}{' '}
+          still watching, so the stream keeps running for them and stops on its own when they
+          leave.
+        </p>
+      )}
 
       {snapshot && snapshot.quotes.length > 0 && (
         <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-3">
@@ -251,11 +318,11 @@ export function PulseTile() {
         </p>
       )}
 
-      {snapshot?.stats && live && (
+      {snapshot?.stats && live && watching && !winding && (
         <p className="mt-3 text-xs opacity-60 tabular-nums">
           pipeline p50 {Math.round(snapshot.stats.pipelineP50Ms)} ms · p99{' '}
           {Math.round(snapshot.stats.pipelineP99Ms)} ms · {Math.round(snapshot.stats.eventsPerSec)}{' '}
-          events/s · last batch {snapshot.stats.sampleCount} trades
+          trades/s from Coinbase · last batch {snapshot.stats.sampleCount} trades
         </p>
       )}
     </section>
