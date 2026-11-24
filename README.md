@@ -1,225 +1,505 @@
 # WealthOS
 
 [![ci](https://github.com/dnguyen-cs/WealthOS---Distributed-Personal-Finance-Platform/actions/workflows/ci.yml/badge.svg)](https://github.com/dnguyen-cs/WealthOS---Distributed-Personal-Finance-Platform/actions/workflows/ci.yml)
+![Next.js 16](https://img.shields.io/badge/Next.js-16-000000?logo=nextdotjs)
+![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white)
+![Go 1.26](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)
+![AWS](https://img.shields.io/badge/AWS-Lambda%20%7C%20SQS%20%7C%20Kinesis%20%7C%20Batch-232F3E)
+![Terraform](https://img.shields.io/badge/Terraform-IaC-7B42BC?logo=terraform&logoColor=white)
 
-Personal finance platform built on Next.js 16, PostgreSQL, and AWS.
-The simulation and streaming compute scales to zero when idle, but the hosted deployment as a whole does not: measured AWS spend for the live demo was $8.86 in September 2026 and $11.35 in October (which included a few days of real use).
-Most of that is Aurora, which pauses at 0 ACU yet still wakes roughly every two hours for its own background work and bills each wake for the full five-minute auto-pause window, plus the public IPv4 address the database endpoint needs; the Route 53 zone adds about $0.50.
-**Live demo: [wealthos.danieln.cloud](https://wealthos.danieln.cloud)** - connect a fake bank with Plaid Sandbox (`user_good` / `pass_good`) and race the two Monte Carlo engines; the first visit after idle waits out the database's ~14s scale-from-zero resume.
-Phase 2 delivered the local core: credentials auth, Plaid Sandbox bank connections, and a dashboard showing accounts, transactions, and net worth.
-WealthSim is the flagship module: a distributed Monte Carlo simulation engine that fans work out over a queue to stateless compute workers, built to run identically against local emulators and AWS (SQS + S3 + Batch on Fargate), with two interchangeable kernel implementations - Node.js and Go - selectable per run and parity-tested against each other down to the bit level of the RNG stream.
-PortfolioPulse is the second module: a real-time market data pipeline (Coinbase websocket -> Kinesis -> Lambda -> DynamoDB -> live dashboard tile) built around on-demand streaming sessions that scale to zero when nobody is watching.
+**A personal finance platform built as a proving ground for cloud-native distributed systems.**
 
-## Stack
+WealthOS links bank accounts through Plaid, projects your net worth forward with a distributed Monte Carlo engine, and streams live crypto prices into a latency-instrumented dashboard.
+Underneath, it is three systems sharing one Next.js app: a queue-fed simulation engine with interchangeable Node.js and Go kernels, a scale-to-zero streaming pipeline, and an idempotent bank-sync service.
+The AWS side is provisioned with Terraform, and every design claim is backed by a benchmark or a chaos test.
 
-- Next.js 16 (App Router) + TypeScript + Tailwind v4; API route handlers are the backend
-- PostgreSQL via Prisma 7 (driver adapter, generated client in `src/generated/prisma`)
-- DynamoDB for coordination state: rate-limit windows, daily budgets, per-item sync locks (conditional writes; no Redis anywhere)
-- Auth.js v5 with email/password credentials and JWT sessions
-- Plaid (Link + `transactions/sync`) for bank data
-- SQS + S3 (ElasticMQ + MinIO locally) and AWS Batch/Fargate (Terraform in `infra/`) for WealthSim compute
-- Two WealthSim worker implementations: Node 22 (`src/workers/wealthsim`) and Go 1.26 (`go-worker/`), one SQS queue per engine
+**Live demo: [wealthos.danieln.cloud](https://wealthos.danieln.cloud)**
 
-## Local setup
+Register, connect a fake bank with the Plaid Sandbox credentials `user_good` / `pass_good`, then race the two simulation engines or press "Go live" on the market tile.
+The first request after a quiet period takes about 14 seconds while the database resumes from zero capacity.
 
-Prerequisites: Node 22, pnpm 10, Docker Desktop, a free [Plaid dashboard](https://dashboard.plaid.com) account for Sandbox keys.
+## Contents
 
-```bash
-cp .env.example .env
-# fill in: AUTH_SECRET (openssl rand -base64 32), PLAID_TOKEN_ENC_KEY (openssl rand -hex 32),
-#          PLAID_CLIENT_ID and PLAID_SECRET from the Plaid dashboard (Sandbox)
+- [Highlights](#highlights)
+- [What it does](#what-it-does)
+- [System architecture](#system-architecture)
+- [WealthSim: distributed Monte Carlo](#wealthsim-distributed-monte-carlo)
+- [PortfolioPulse: real-time market data](#portfoliopulse-real-time-market-data)
+- [Core app: auth and bank sync](#core-app-auth-and-bank-sync)
+- [Cost](#cost)
+- [Tech stack](#tech-stack)
+- [Repository layout](#repository-layout)
+- [Getting started](#getting-started)
+- [Testing and verification](#testing-and-verification)
+- [Deploying to AWS](#deploying-to-aws)
+- [Roadmap](#roadmap)
 
-pnpm install
-docker compose up -d db queue objectstore stream table   # Postgres 5434, ElasticMQ 9324, MinIO 9000, kinesis-mock 4568, dynamodb-local 8000
-docker compose up -d worker worker-go             # both compute engines (scale with --scale worker=4 etc.)
-pnpm prisma migrate dev                           # create tables
-pnpm dev                                          # app on http://localhost:3000
+## Highlights
+
+| Result | How |
+|---|---|
+| **100M Monte Carlo paths in 25.6 s** | 64 Go workers on AWS Batch (Fargate), ~3.91M paths/s, about $0.035 per job all-in |
+| **Bit-exact RNG across two languages** | Node.js and Go kernels produce identical random streams; full-pipeline results agree to within 2.5e-15 relative |
+| **Idempotency proven under failure** | Killing a worker mid-job still yields byte-identical results, on local emulators and on real Fargate, for both engines |
+| **~29x variance reduction** | Antithetic variates cut median-estimator variance ~29x, so the same confidence interval needs ~97% fewer paths |
+| **167 ms p50 streaming latency** | Live Coinbase trades from ingest to DynamoDB write, down from 694 ms after moving from shard polling to Kinesis enhanced fan-out |
+| **$0 idle compute** | Simulation workers scale to zero, streaming sessions end when nobody is watching, and a daily janitor deletes the idle Kinesis stream |
+
+## What it does
+
+| Module | For the user | Under the hood |
+|---|---|---|
+| **Core app** | Sign up, link bank accounts, see balances, transactions, and net worth | Auth.js credentials, Plaid `transactions/sync`, encrypted access tokens, DynamoDB sync lease, Aurora Serverless v2 |
+| **WealthSim** | Project a portfolio 1 to 60 years out and see median and percentile bands per year; race the Node.js and Go engines on the same seed | Standard SQS fan-out to stateless workers on Lambda or Batch/Fargate, mergeable histograms in S3, aggregation on read |
+| **PortfolioPulse** | Watch live BTC, ETH, and SOL prices with 1-minute OHLCV bars and live latency percentiles | On-demand ingest session holding a Coinbase websocket, Kinesis with enhanced fan-out, exactly-once bar merges in DynamoDB |
+
+## System architecture
+
+The app runs on Vercel and talks to AWS through a least-privilege IAM user.
+Everything on the AWS side is defined in [`infra/`](infra), except the Kinesis stream, which the ingest creates on demand.
+
+```mermaid
+flowchart TB
+    browser([Browser]) --> app["Next.js 16 app on Vercel<br/>pages + API routes"]
+
+    subgraph core [Core app]
+        plaid[Plaid Sandbox API]
+        aurora[("Aurora Serverless v2<br/>Postgres, min 0 ACU")]
+        appstate[("DynamoDB app-state<br/>rate limits, budgets, locks")]
+    end
+
+    subgraph sim [WealthSim]
+        queues["SQS<br/>one queue per engine"]
+        workers["Stateless workers<br/>Lambda or Fargate<br/>Node.js and Go"]
+        s3[("S3 chunk summaries")]
+    end
+
+    subgraph pulse [PortfolioPulse]
+        coinbase[Coinbase websocket]
+        ingest[pulse-ingest Lambda]
+        kinesis[Kinesis stream]
+        consumer[pulse-consumer Lambda]
+        pulsetable[(DynamoDB pulse table)]
+    end
+
+    app --> plaid
+    app --> aurora
+    app --> appstate
+    plaid ~~~ aurora ~~~ appstate
+    app -- "enqueue chunks" --> queues --> workers --> s3
+    app -- "Go live" --> ingest
+    coinbase --> ingest --> kinesis --> consumer --> pulsetable
 ```
 
-Postgres is published on host port 5434 (not 5432) to avoid clashing with natively installed Postgres instances.
-Alternatively run everything in containers: `docker compose up` also builds and starts the app service.
-Note for Docker-on-Windows: file change events do not propagate into the bind mount, so the containerized app needs `docker compose restart app` to pick up host edits; `pnpm dev` on the host is the primary dev loop.
+The app also reads back from both compute modules: it aggregates chunk summaries from S3 when a simulation finishes, and the market tile polls the Pulse table.
+Simulations from the public site run on scale-to-zero Lambdas, while benchmark fleets run on AWS Batch through separate queues.
 
-## Trying it out
+Three ideas run through the whole system:
 
-1. Register at `/register`, which signs you in and lands on `/dashboard`.
-2. Click "Connect a bank" to open Plaid Link in Sandbox mode.
-3. Pick any institution and log in with the Sandbox test credentials `user_good` / `pass_good`.
-4. Accounts and transactions sync into Postgres and render on the dashboard; "Sync" re-runs an incremental `transactions/sync`.
-5. Open "Simulations", set your assumptions, pick a compute engine (Node.js or Go - same results, parity-tested), and run a 1M-path Monte Carlo projection; the fan chart shows median and percentile bands per year.
-6. Or click "Race both engines": the identical seed runs on Node.js and Go simultaneously with side-by-side progress, and a verification badge reports the measured divergence between the two results (floating-point ulps, ~1e-15).
+- **Local and cloud run the same code.**
+  Every AWS client honors an endpoint override, so ElasticMQ, MinIO, kinesis-mock, and dynamodb-local stand in for SQS, S3, Kinesis, and DynamoDB in `docker compose`.
+  There are no code forks between local and AWS; only environment variables change.
+- **Correctness by construction, then proof by failure.**
+  Idempotency comes from determinism or from transactional checkpoints rather than from hope, and chaos tests kill workers, steal leases, and inject poison records to show it holds.
+- **Cost is a design input.**
+  Everything that bills by the hour either scales to zero or is torn down, public endpoints are metered by fail-closed guards, and benchmarks report cost alongside speed.
 
-## WealthSim architecture
+## WealthSim: distributed Monte Carlo
 
+WealthSim projects portfolio value with geometric Brownian motion over monthly steps, with annual contributions, for up to 10 million paths per job.
+A job is split into 50,000-path chunks, one SQS message each, and any number of stateless workers process them in any order.
+There is no coordinator: the first status read that finds every chunk summary in S3 aggregates them and finalizes the job.
+
+```mermaid
+%%{init: {"sequence": {"actorMargin": 30, "width": 120}}}%%
+sequenceDiagram
+    participant B as Browser
+    participant API as Next.js API
+    participant DB as Postgres
+    participant Q as SQS
+    participant W as Workers
+    participant S3
+
+    B->>API: POST run
+    API->>API: Check guards
+    API->>DB: Insert job
+    API->>Q: Enqueue chunks
+    API-->>B: 202 (jobId)
+    loop Each chunk, any worker
+        Q->>W: Chunk spec
+        W->>W: GBM kernel
+        W->>S3: Put summary
+    end
+    loop Until every chunk is present
+        B->>API: GET status
+        API->>S3: List summaries
+    end
+    API->>API: Merge histograms
+    API->>DB: Insert result
+    API-->>B: Percentile bands
 ```
-POST /api/wealthsim/run  (engine: node | go)
-  -> SimulationJob row (Postgres)
-  -> one SQS message per 50K-path chunk        (standard queue, not FIFO; one queue per engine)
-       -> N stateless workers (Node or Go GBM kernel)
-            -> one summary object per chunk (S3: histogram + moments per year, identical contract)
-GET /api/wealthsim/jobs/[id]
-  -> all chunk objects present? aggregate -> SimulationResult row -> fan chart
-```
 
-Design decisions, and why:
+The run endpoint is `POST /api/wealthsim/run` and status reads are `GET /api/wealthsim/jobs/[jobId]`.
+Workers are Lambdas for the public demo or Batch tasks on Fargate for benchmarks, each engine on its own queue.
 
-- **Standard queue instead of the originally planned SQS FIFO.** FIFO locks a message group while one message is in flight, so grouping a job's chunks would serialize them and defeat the fan-out. At-least-once delivery is safe here because processing is idempotent.
-- **Idempotency by determinism, not locks.** A chunk spec carries a seed; the kernel's PRNG (sfc32) is deterministic, and the result goes to a deterministic S3 key. A redelivered message reproduces identical statistics at the same key (only the timing/worker-id metadata fields differ; the job's final aggregated results are byte-identical), so retries and duplicates are harmless by construction. (Contrast with the Plaid sync, which uses a DynamoDB conditional-write lease because its external effects are not replayable.)
-- **Workers are fully stateless** - no database, no Redis; everything a chunk needs rides in the message, results land in object storage. That is what lets the same container image run under docker compose and AWS Batch, and lets a benchmark fleet scale to N workers with zero coordination.
-- **Mergeable statistics.** Workers cannot ship raw paths (1M paths x 30 years is gigabytes) and percentiles do not average across workers. Each chunk records per-year log-binned histograms plus exact moments (count/sum/sumSq/min/max); histograms with identical bounds merge by element-wise addition, and percentiles read off the merged bins to within ~1.4% bin width.
-- **No coordinator process.** Completion is detected lazily on status reads: when a read finds every chunk object present, it aggregates and finalizes. A concurrent double-finalize resolves via the unique constraint on `SimulationResult.jobId`.
-- **Local/cloud parity via endpoint overrides.** The same `@aws-sdk` clients talk to ElasticMQ/MinIO locally (`SQS_ENDPOINT`/`S3_ENDPOINT` set) or real AWS (unset). No code forks.
-- **Variance reduction as cost engineering.** Paths are generated as antithetic +Z/-Z pairs (toggleable per request). Marginal distributions are unchanged, but estimator variance drops sharply where the estimator is smooth in the shocks: measured VRF at 30y is ~29x for the median (97% fewer paths for the same confidence interval), ~2.2x for the mean, and ~1x in the tails - reported per-statistic because pairing does nothing for extreme quantiles. Sharing each draw across the pair also made the kernel ~1.6x faster at equal path count.
-- **Reproducible runs.** The run API accepts an optional seed; the same seed reproduces byte-identical results, which is also what the chaos test exploits.
-- **Two engines, one contract.** The Go worker (`go-worker/`) is a bit-faithful port of the kernel: sfc32/splitmix32 are pure 32-bit integer math, so the raw random streams are bit-identical across languages (asserted against Node-generated test vectors, including all sampled normal draws). PCG64 was rejected as the shared PRNG because its 128-bit multiplies have no fast JavaScript path - it would have benchmarked a BigInt workaround instead of the runtimes.
-- **Where cross-language determinism ends.** IEEE 754 guarantees correctly rounded add/sub/mul/div/sqrt but not exp/log, so float accumulators drift a few ulps between runtimes in the GBM compounding loop: measured 2.4-4.5e-16 relative on golden chunks (histogram bins exactly equal) and 2.5e-15 end to end. Per-engine reruns are byte-identical; cross-engine equality is asserted numerically, not byte-wise.
-- **Idempotency proven, not just claimed.** `scripts/chaos-test.ts` (local) and `scripts/chaos-test-aws.ts` (real Fargate task termination) run a control job and a chaos job with the same seed, kill a worker mid-run, wait for SQS redelivery, and assert the disrupted job's results are byte-identical to the control's. All four runs pass (local and AWS, once per engine); the two AWS runs happened to land on opposite sides of the termination race - the Node task stranded an in-flight chunk (recovered via 300s SQS redelivery), while the Go task's SIGTERM handler finished and deleted its chunk before exiting - byte-identical either way.
-- **A rule the chaos test discovered:** worker idle-exit must exceed the queue's visibility timeout. The first AWS chaos run stalled at 39/40 chunks because the surviving worker idle-exited (60s) before the killed worker's in-flight chunk became visible again (300s) - durability held (nothing lost), but liveness broke (no consumer left). Idle-exit is now 360s.
-- **Two lanes, selected by environment.** The hosted demo runs on a separate queue pair (`wealthsim-demo-*`) consumed by scale-to-zero Lambdas (one per engine, x86_64, 1769 MB = 1 full vCPU, batch size 1), while the `wealthsim-jobs*` queues stay reserved for Batch benchmark fleets. The app picks a lane purely via `WEALTHSIM_QUEUE_URL`/`WEALTHSIM_QUEUE_URL_GO`, so demo users and benchmark fleets can never contend. Handlers reuse the worker kernel/storage modules unchanged (`src/workers/wealthsim/lambda.ts`, `go-worker/cmd/lambda`); `pnpm build:lambdas` produces both artifacts.
-- **Abuse guards that fail closed.** The public run endpoint enforces a per-deployment path cap, a per-user runs-per-minute window (429 + Retry-After), and a global daily path budget with atomic consume-or-rollback (DynamoDB conditional writes); registration and login are metered per IP. If the backing store is unreachable the guarded endpoints refuse rather than open - they spend real compute when unguarded.
+### Design decisions
+
+- **Standard queue, not FIFO.**
+  FIFO locks a message group while one message is in flight, so grouping a job's chunks would serialize the fan-out.
+  At-least-once delivery is safe because processing is idempotent.
+- **Idempotency by determinism, not locks.**
+  Each chunk carries a seed for a deterministic PRNG (sfc32) and writes to a deterministic S3 key, so a redelivered message rewrites identical statistics to the same place.
+  Workers hold no state at all, which is what lets one container image run under `docker compose`, AWS Batch, and Lambda.
+- **Mergeable statistics.**
+  Raw paths cannot leave the worker (1M paths over 30 years is gigabytes), and percentiles do not average across workers.
+  Each chunk instead records per-year log-binned histograms plus exact moments; histograms with identical bounds merge by element-wise addition, and percentiles read off the merged bins to within ~1.4% of bin width.
+- **Lazy, race-safe finalization.**
+  Completion is detected on status reads, and a concurrent double-finalize resolves through the unique constraint on `SimulationResult.jobId`.
+- **Two engines, one contract.**
+  The Go worker in [`go-worker/`](go-worker) is a bit-faithful port of the TypeScript kernel.
+  sfc32 and splitmix32 are pure 32-bit integer math, so both runtimes produce bit-identical random streams; PCG64 was rejected because its 128-bit multiplies have no fast JavaScript path.
+- **Where cross-language determinism ends.**
+  IEEE 754 guarantees correctly rounded add, multiply, divide, and square root, but not `exp` or `log`, so accumulators drift a few ulps between runtimes.
+  Reruns on one engine are byte-identical; cross-engine equality is asserted numerically, and measures 2.5e-15 relative end to end.
+- **Variance reduction as cost engineering.**
+  Paths are generated as antithetic +Z/-Z pairs, which leaves marginal distributions unchanged while sharply reducing estimator variance where the estimator is smooth in the shocks.
+  Sharing each draw across a pair also made the kernel ~1.6x faster at equal path count.
+- **A liveness rule found by the chaos test.**
+  The first AWS chaos run stalled at 39 of 40 chunks: the surviving worker idle-exited after 60 s, before the killed worker's in-flight chunk became visible again at 300 s.
+  Nothing was lost, but nothing was left to consume it, so worker idle-exit is now 360 s, above the visibility timeout.
+- **Two lanes, chosen by environment.**
+  The public demo uses its own queue pair, consumed by scale-to-zero Lambdas (one per engine, 1 full vCPU, capped at 16 concurrent executions), while Batch benchmark fleets use separate queues.
+  The app picks a lane purely through `WEALTHSIM_QUEUE_URL` and `WEALTHSIM_QUEUE_URL_GO`, so demo users and benchmarks never contend.
+- **Abuse guards that fail closed.**
+  The public run endpoint enforces a per-deployment path cap, a per-user runs-per-minute window (429 with `Retry-After`), and a global daily path budget with atomic consume-or-rollback on DynamoDB.
+  If the backing store is unreachable, guarded endpoints refuse instead of opening, because they spend real compute.
 
 ### Benchmarks
 
-`pnpm bench` (Node) and `go run ./cmd/bench` in `go-worker/` (Go) measure the kernel locally (control groups for the distributed scaling curve).
-On a Ryzen 7 9800X3D (8C/16T), 30-year horizon, monthly steps, antithetic pairing on:
-
-| Setup | Node | Go |
-|---|---|---|
-| 1 thread/goroutine | ~166K paths/s (~60M GBM steps/s) | ~175K paths/s (+5%) |
-| 8 threads/goroutines | ~865K paths/s (x5.36) | ~1.00M paths/s (+16%) |
-| 16 threads/goroutines | ~861K paths/s (no SMT gain) | ~1.24M paths/s (+44%) |
-
-The honest surprise: V8's JIT lands within 5% of compiled Go on this FP-bound loop single-threaded; Go's wins are scaling through SMT and a 12.5 MB worker image vs Node's 1.2 GB (image pull dominates Fargate cold start).
-Near-linear scaling to the 8 physical cores either way (independent sampling measured ~105K paths/s per thread before pairing).
-Through the full local pipeline (queue + containerized workers + object store), a 2M-path job went from 18.8s wall at 1 worker to 7.0s at 4 workers on the same machine (pre-antithetic kernel); a 1M-path job runs 7.3s on one Node worker vs 6.2s on one Go worker.
-
-Cross-engine parity (`pnpm exec tsx scripts/parity-test.ts`, same seed through the full pipeline): a rerun on the Go engine is byte-identical, and node-vs-go results diverge by at most 2.53e-15 relative; `go test ./...` additionally proves the RNG streams bit-exact against vectors generated from the Node kernel (`scripts/gen-parity-vectors.ts`).
-
-Variance study (`pnpm exec tsx scripts/variance-test.ts`, 100 seeded replications x 10K paths, 30y):
-
-| Estimator | VRF (antithetic vs independent) | Equal-CI path savings |
-|---|---|---|
-| median | ~29x | ~97% |
-| mean | ~2.2x | ~55% |
-| p90 | ~1.2x | ~17% |
-| p10 | ~0.9x | none (slight regression, within estimation noise) |
-
-AWS Batch scaling curve (Fargate, 1 vCPU / 2GB per Node worker, 10M-path jobs, mean of 3 seeded runs, hot fleet - cold start excluded and measured separately at 48s to 16 RUNNING / 100s to 64 RUNNING):
-
-| Workers | Wall time | Throughput | Speedup | Cost per 1M paths |
-|---|---|---|---|---|
-| 1 | 157.6s | ~63K paths/s | x1.00 | ~$0.00022 |
-| 2 | 65.6s | ~152K paths/s | x2.40 | ~$0.00018 |
-| 4 | 43.3s | ~231K paths/s | x3.64 | ~$0.00024 |
-| 8 | 24.1s | ~414K paths/s | x6.53 | ~$0.00027 |
-| 16 | 19.7s | ~519K paths/s | x8.0 | ~$0.0004 |
-| 64 | 8.2s | ~1.21M paths/s | x19.1 | ~$0.0007 |
-
-10M paths saturates around 16 workers (200 chunks across 64 workers leaves fixed submit/enqueue/aggregate costs dominating); scaling the workload 10x restores the curve:
-
-| Workers | 100M-path wall | Throughput | Efficiency | Cost per 1M paths |
-|---|---|---|---|---|
-| 16 | 104.4s | ~959K paths/s | 95% | ~$0.0002 |
-| 64 | 31.8s | ~3.14M paths/s | 78% | ~$0.0003 |
-
-Same harness, same seeds, Go engine (1 vCPU / 2GB per worker, hot fleet; Go fleet cold start is 19-25s for 1-16 workers vs Node's 48s thanks to the 4.7 MB compressed image, but 64 workers took 136s - at that size Fargate capacity scheduling dominates image pull):
-
-| Workers | 10M-path wall | Throughput | Speedup | vs Node wall |
-|---|---|---|---|---|
-| 1 | 145.0s | ~69K paths/s | x1.00 | -8% |
-| 2 | 72.1s | ~139K paths/s | x2.01 | +10% |
-| 4 | 34.9s | ~287K paths/s | x4.16 | -19% |
-| 8 | 20.8s | ~480K paths/s | x6.96 | -14% |
-| 16 | 12.5s | ~797K paths/s | x11.6 | -37% |
-| 64 | 7.2s | ~1.40M paths/s | x20.3 | -12% |
-
-| Workers | 100M-path wall | Throughput | Cost per 1M paths |
-|---|---|---|---|
-| 16 | 74.5s | ~1.34M paths/s | ~$0.00016 |
-| 64 | 25.6s | ~3.91M paths/s | ~$0.00022 |
-
-**100 million Monte Carlo paths in 25.6 seconds at 64 Go workers (~3.91M paths/s) for ~$0.0225 of compute** (~$0.035 all-in once S3/SQS request pricing is counted) - 19% faster and 20% cheaper than the Node engine's 31.8s, and roughly x57 a single worker's throughput.
-Honest caveats, from the data: the superlinear x2.40 at 2 Node workers and the per-row vs-Node swings (-37% to +10%) are Fargate hardware heterogeneity (per-worker throughput ranged +/-20% across fleet placements; within-fleet repeats are +/-2%); on summed kernel compute time, which cancels placement luck, Go is ~21% faster per Fargate vCPU than Node (~95K vs ~78K paths/s per compute-second) - a larger gap than the +5% single-thread desktop result.
-Short 1M-path jobs scale worse (x4.9 at 8 workers) because submit/aggregation fixed costs stop amortizing, and the 100M finalize step queues ~1200-1500 S3 GETs behind the SDK's 50-socket pool - the documented next bottleneck.
+All numbers are measured; raw per-run data lives in [`bench-results/`](bench-results).
 Every benchmark run doubled as a determinism check: identical seeds produced byte-identical results across all worker counts and repeats.
-Raw per-run data: `bench-results/aws.jsonl`; harness: `scripts/bench-aws.ts` (env: `ENGINE=node|go`, `WORKERS`, `PATHS_LIST`, `REPEATS`, plus `VCPUS`/`CONCURRENCY` for multi-vCPU Go tasks).
 
-### The compute plane on AWS (deployed)
+**AWS Batch on Fargate**, 1 vCPU and 2 GB per worker, 30-year horizon, mean of 3 seeded runs on a warm fleet:
 
-Terraform in `infra/` provisions the full compute plane: public subnets + IGW (no NAT by design), one standard SQS queue + DLQ per engine, S3 results bucket (30-day lifecycle), two ECR repos, Batch Fargate compute environment/queue and one job definition per engine, least-privilege IAM (workers can only consume their queues and put objects under `jobs/`), an account-level budget alarm, and CloudWatch alarms that email via SNS the moment anything lands in a DLQ.
-It also provisions the scale-to-zero demo lane: per-engine demo queues + DLQs + alarms, the two Lambda consumers capped at 16 concurrent executions per engine via ESM `maximum_concurrency` (reserved concurrency deliberately unused - one cap mechanism is enough), and a minimal-privilege IAM user for the hosted app (send to demo queues, read results - nothing else).
-Measured on the demo lane: the 2M-path public-cap job runs 10.9s (node) / 8.9s (go) warm, and a 10M-path burst 19.5s - within 7s of a pre-provisioned 16-worker Fargate fleet, from zero standing infrastructure; short bursts are limited by Lambda's gradual SQS poller ramp (effective parallelism ~3 at 40 chunks, ~6.6 at 200), not by the cap.
-State lives in a versioned S3 backend with native locking.
-Workers on Batch set `WORKER_IDLE_EXIT_SECONDS=360` - above the 300s visibility timeout, the liveness invariant the chaos test discovered - so a benchmark fleet drains the queue and self-terminates instead of billing Fargate time.
-Steady-state idle compute cost of the demo plane: $0; the hosted deployment's Aurora and public-IPv4 floor (measured at the top of this README) is separate.
+| Workers | 10M paths, Node.js | 10M paths, Go | 100M paths, Node.js | 100M paths, Go |
+|---:|---:|---:|---:|---:|
+| 1 | 157.6 s | 145.0 s | | |
+| 4 | 43.3 s | 34.9 s | | |
+| 8 | 24.1 s | 20.8 s | | |
+| 16 | 19.7 s | 12.5 s | 104.4 s (95% efficiency) | 74.5 s |
+| 64 | 8.2 s | 7.2 s | 31.8 s (~3.14M paths/s) | **25.6 s (~3.91M paths/s)** |
 
-```bash
-cd infra && terraform plan -out=tfplan && terraform apply tfplan
-aws ecr get-login-password | docker login --username AWS --password-stdin <account>.dkr.ecr.us-east-1.amazonaws.com
-docker build --platform linux/amd64 -f docker/Dockerfile.worker    -t <ecr-url>:latest    . && docker push <ecr-url>:latest
-docker build --platform linux/amd64 -f docker/Dockerfile.worker-go -t <ecr-url-go>:latest . && docker push <ecr-url-go>:latest
-aws batch submit-job --job-queue wealthsim --job-definition wealthsim-worker ...     # Node fleet
-aws batch submit-job --job-queue wealthsim --job-definition wealthsim-worker-go ...  # Go fleet
+- 100M paths on 64 Go workers costs ~$0.0225 of compute, or ~$0.035 including S3 and SQS requests; that is 19% faster and 20% cheaper than the Node.js engine.
+- 10M paths saturates around 16 workers because fixed submit, enqueue, and aggregate costs dominate; a 10x larger workload restores near-linear scaling.
+- On summed kernel time, which cancels out Fargate placement luck, Go is about 21% faster per vCPU (roughly 95K vs 78K paths per compute-second).
+- Go's 12.5 MB image (vs 1.2 GB for Node.js) brings fleet cold start down from 48 s to 19-25 s for up to 16 workers.
+- The next bottleneck is documented: finalizing a 100M-path job queues ~1,200-1,500 S3 GETs behind the SDK's 50-socket pool.
+
+<details>
+<summary>Full scaling tables, local kernel, Lambda lane, and variance study</summary>
+
+**Node.js engine on Fargate**
+
+| Workers | 10M wall | Throughput | Speedup | Cost per 1M paths |
+|---:|---:|---:|---:|---:|
+| 1 | 157.6 s | ~63K paths/s | x1.00 | ~$0.00022 |
+| 2 | 65.6 s | ~152K paths/s | x2.40 | ~$0.00018 |
+| 4 | 43.3 s | ~231K paths/s | x3.64 | ~$0.00024 |
+| 8 | 24.1 s | ~414K paths/s | x6.53 | ~$0.00027 |
+| 16 | 19.7 s | ~519K paths/s | x8.0 | ~$0.0004 |
+| 64 | 8.2 s | ~1.21M paths/s | x19.1 | ~$0.0007 |
+
+| Workers | 100M wall | Throughput | Efficiency | Cost per 1M paths |
+|---:|---:|---:|---:|---:|
+| 16 | 104.4 s | ~959K paths/s | 95% | ~$0.0002 |
+| 64 | 31.8 s | ~3.14M paths/s | 78% | ~$0.0003 |
+
+**Go engine on Fargate**
+
+| Workers | 10M wall | Throughput | Speedup | vs Node.js wall |
+|---:|---:|---:|---:|---:|
+| 1 | 145.0 s | ~69K paths/s | x1.00 | -8% |
+| 2 | 72.1 s | ~139K paths/s | x2.01 | +10% |
+| 4 | 34.9 s | ~287K paths/s | x4.16 | -19% |
+| 8 | 20.8 s | ~480K paths/s | x6.96 | -14% |
+| 16 | 12.5 s | ~797K paths/s | x11.6 | -37% |
+| 64 | 7.2 s | ~1.40M paths/s | x20.3 | -12% |
+
+| Workers | 100M wall | Throughput | Cost per 1M paths |
+|---:|---:|---:|---:|
+| 16 | 74.5 s | ~1.34M paths/s | ~$0.00016 |
+| 64 | 25.6 s | ~3.91M paths/s | ~$0.00022 |
+
+The superlinear x2.40 at 2 Node.js workers and the per-row swings against Node.js come from Fargate hardware heterogeneity: per-worker throughput ranged +/-20% across fleet placements, while repeats within one fleet varied +/-2%.
+Fleet cold start is measured separately: 48 s to 16 running Node.js tasks and 100 s to 64; 19-25 s for 1-16 Go tasks, but 136 s at 64, where Fargate capacity scheduling outweighs image pull.
+
+**Local kernel** (Ryzen 7 9800X3D, 8 cores / 16 threads, antithetic pairing on)
+
+| Setup | Node.js | Go |
+|---|---:|---:|
+| 1 thread or goroutine | ~166K paths/s | ~175K paths/s (+5%) |
+| 8 threads or goroutines | ~865K paths/s | ~1.00M paths/s (+16%) |
+| 16 threads or goroutines | ~861K paths/s (no SMT gain) | ~1.24M paths/s (+44%) |
+
+V8's JIT lands within 5% of compiled Go on this floating-point loop single-threaded; Go's advantages are scaling through SMT and a far smaller image.
+
+**Lambda demo lane** (scale-to-zero, capped at 16 concurrent executions per engine)
+
+| Job | Wall time |
+|---|---:|
+| 2M paths, warm, Node.js | 10.9 s |
+| 2M paths, warm, Go | 8.9 s |
+| 10M-path burst | 19.5 s |
+
+A 10M-path burst lands within 7 s of a pre-provisioned 16-worker Fargate fleet with zero standing infrastructure.
+Short bursts are limited by Lambda's gradual SQS poller ramp (effective parallelism ~3 at 40 chunks, ~6.6 at 200), not by the concurrency cap.
+
+**Variance study** (100 seeded replications of 10K paths, 30-year horizon)
+
+| Estimator | Variance reduction (antithetic vs independent) | Paths saved at equal CI |
+|---|---:|---:|
+| Median | ~29x | ~97% |
+| Mean | ~2.2x | ~55% |
+| p90 | ~1.2x | ~17% |
+| p10 | ~0.9x | none (within estimation noise) |
+
+Results are reported per statistic because pairing does nothing for extreme quantiles.
+
+</details>
+
+## PortfolioPulse: real-time market data
+
+PortfolioPulse streams live trades for BTC-USD, ETH-USD, and SOL-USD from Coinbase into 1-minute OHLCV bars and a dashboard tile that shows prices alongside the pipeline's own latency percentiles.
+The one component a streaming pipeline normally cannot scale to zero is the process holding the websocket, so it runs as an on-demand Lambda session instead of a server.
+
+```mermaid
+flowchart TB
+    subgraph produce [Ingest]
+        direction LR
+        cb["Coinbase websocket<br/>BTC, ETH, SOL trades"]
+        ingest["pulse-ingest Lambda<br/>one session at a time,<br/>up to 100 trades per record"]
+        kinesis["Kinesis stream<br/>1 shard, keyed by symbol"]
+        janitor["pulse-janitor Lambda<br/>deletes the stream<br/>after 6 idle hours"]
+        cb --> ingest --> kinesis
+        janitor -.-> kinesis
+    end
+
+    subgraph consume [Consume]
+        direction LR
+        consumer["pulse-consumer Lambda<br/>bars + shard checkpoint<br/>in one transaction"]
+        table[("DynamoDB pulse table<br/>quotes, 1-min bars,<br/>session state")]
+        tile["Dashboard tile<br/>polls every 1.5 s"]
+        consumer --> table --> tile
+    end
+
+    produce -- "enhanced fan-out<br/>HTTP/2 push" --> consume
 ```
 
-The app then points `WEALTHSIM_QUEUE_URL`/`WEALTHSIM_QUEUE_URL_GO`/`WEALTHSIM_BUCKET` at the Terraform outputs (drop the local `*_ENDPOINT` overrides); `scripts/run-aws-job.ts` and `scripts/bench-aws.ts` drive jobs against the real queues.
+Sessions start when a viewer presses "Go live" and end when nobody is watching:
 
-## PortfolioPulse architecture
+```mermaid
+sequenceDiagram
+    participant V as Viewer
+    participant API as Next.js API
+    participant T as DynamoDB
+    participant I as Ingest Lambda
 
+    V->>API: Go live
+    API->>T: Record viewer
+    opt No session running
+        API->>I: Async invoke
+        I->>T: Acquire lease
+        I->>I: Start stream, connect
+    end
+    loop While watching
+        V->>API: Poll (keepalive)
+    end
+    V->>API: Stop
+    alt No other active viewer
+        API->>T: Write stop request
+        I->>T: Sees stop, exits
+    else Others still watching
+        API-->>V: Keeps running for them
+    end
 ```
-Coinbase WS (matches: BTC/ETH/SOL-USD)
-  -> pulse-ingest Lambda    one session at a time (DynamoDB conditional-write lease),
-     |                      started by "Go live", exits on Stop or when viewers stop polling
-     |  PutRecords, partition key = symbol, N events packed per record
-  -> Kinesis pulse-events   1 shard; created lazily, deleted by a daily janitor after idle hours
-  -> pulse-consumer Lambda  (enhanced fan-out mapping, records pushed over HTTP/2;
-     |                      parallelization 1 = one writer per shard)
-     |  per-shard sequence checkpoint committed atomically WITH the data (TransactWriteItems)
-  -> DynamoDB pulse table   latest quotes + 1-min OHLCV bars + session state (TTL'd)
-  -> GET /api/pulse         dashboard tile polls 1-2s; polling doubles as the viewer keepalive
-```
 
-Design decisions, and why:
+"Go live" is `POST /api/pulse/session`, Stop is `DELETE` on the same route, and the tile's `GET /api/pulse` polls double as the viewer keepalive.
+The ingest checks for a stop request every 2 seconds, and the lease is a DynamoDB conditional write, so concurrent "Go live" clicks still start only one session.
 
-- **Sessions, not servers.** The one component a streaming pipeline can't scale to zero is the thing holding the websocket - so it runs as an on-demand Lambda session (up to ~15 min, renewed interest = new session) guarded by a DynamoDB lease: N users clicking "Go live" resolve to exactly one ingest, and a crashed session's lease expires by TTL. Idle days cost $0 because the janitor also deletes the Kinesis stream, its fan-out consumer, and the event source mapping (the stream and the consumer bill hourly whether or not events flow). Pressing Stop ends the session within about 2s once nobody else is watching; otherwise it keeps running for the remaining viewers.
-- **Bars merge in any order.** Open/close are chosen by exchange timestamps (not arrival order), high/low by max/min, volume by addition - OHLCV bars form a commutative monoid, the same mergeable-statistics discipline as WealthSim's histograms. Replays and reorderings cannot scramble a price.
-- **Exactly-once on top of at-least-once.** The consumer keeps a per-shard sequence-number checkpoint and commits it in the same DynamoDB transaction as the bars it covers: a replayed batch is filtered before it can double-count volume. (The residual hole - a producer retry whose reported failure actually landed - is bounded and documented, not hidden.)
-- **Push, not poll.** A standard Kinesis mapping polls each shard about once per second, so an event waited ~0.5s on average before the consumer saw it, which set the floor under the old ~700ms p50.
-  The consumer now reads through a registered enhanced fan-out consumer that pushes records over HTTP/2 as they land, with no batching window; the ingest's 200ms flush is the remaining batching step.
-  It cut live p50 from 694ms to 167ms for about $0.015/hour of stream-consumer time plus more frequent, smaller consumer writes (costed below); `PULSE_ENHANCED_FAN_OUT=0` restores polling for an A/B run.
-- **Two latency segments, reported separately.** exchange->ingest includes the exchange's pipeline and clock skew; ingest->DynamoDB-write is the segment this system controls and the p50/p99 the tile displays.
-- **Local/cloud parity again.** kinesis-mock and dynamodb-local in compose behind the same endpoint-override pattern as ElasticMQ/MinIO; `scripts/pulse-ingest-local.ts` and `scripts/pulse-consumer-local.ts` are the local dev loop (a synthetic source generates load without touching the internet).
+### Design decisions
 
-Measured on the live plane (synthetic load via `scripts/bench-pulse.ts`, raw runs in `bench-results/pulse.jsonl`; live sessions sampled from the consumer's own stats, raw summary in `bench-results/pulse-live.jsonl`):
+- **Sessions, not servers.**
+  Any number of viewers pressing "Go live" resolve to exactly one ingest through a DynamoDB lease, and a crashed session's lease expires on its own.
+  A session also exits when viewers stop polling or after 15 minutes, and the daily janitor deletes the stream, its fan-out consumer, and the event source mapping, all of which bill hourly whether or not data flows.
+- **Bars merge in any order.**
+  Open and close are chosen by exchange timestamp rather than arrival order, high and low by max and min, and volume by addition.
+  OHLCV bars form a commutative monoid, the same mergeable-statistics discipline as WealthSim's histograms, so replays and reordering cannot scramble a price.
+- **Exactly-once on top of at-least-once.**
+  The consumer commits a per-shard sequence checkpoint in the same DynamoDB transaction as the bars it covers, so a replayed batch is filtered before it can double-count volume.
+  The remaining gap, a producer retry whose reported failure actually landed, is bounded and documented.
+- **Push, not poll.**
+  A standard Kinesis mapping polls each shard about once per second, which set the floor under the original ~700 ms p50.
+  The consumer now reads through an enhanced fan-out consumer that pushes records over HTTP/2 as they land, cutting live p50 from 694 ms to 167 ms.
+  The price is ~$0.16 instead of ~$0.11 per live hour: the consumer-hour charge plus ~2.8 smaller consumer invocations per second instead of one.
+- **Record packing.**
+  A shard accepts 1,000 records/s but 1 MB/s, so packing many trades into each record raises the per-shard ceiling from ~1,386 to ~10,000 events/s.
+- **Stop that respects other viewers.**
+  Stop means "I am done watching"; the shared session ends only when nobody else is actively polling, so one viewer can never cut off another.
 
-| What | Number |
+### Measurements
+
+Measured on the live AWS plane; raw runs are in [`bench-results/pulse.jsonl`](bench-results/pulse.jsonl) and [`bench-results/pulse-live.jsonl`](bench-results/pulse-live.jsonl).
+
+| What | Result |
 |---|---|
-| Per-shard ceiling, naive (1 event/record) | ~1,386 events/s (records/s-bound) |
-| Per-shard ceiling, packed (10-100 events/record) | ~10,000 events/s (byte-bound) - x7.2 from record aggregation |
-| Pipeline p50, 100 -> 5,000 ev/s synthetic load (standard polling) | 806ms -> 889ms (50x load, +10% latency: batching-dominated) |
-| Live Coinbase session, enhanced fan-out (single clock domain, 651 trades) | p50 167ms / p90 256ms / p99 304ms, worst 351ms |
-| Live Coinbase session, standard polling | p50 694ms / p99 991ms |
-| 100K-event backlog after an outage | drained in 1.5s (~67K ev/s - intake-bound recovery, 6.7x the shard ceiling) |
-| Cold "Go live" -> first data | ~90s with fan-out (stream, consumer, and mapping creation; the new mapping's first delivery took 78s and replayed the queued trades); 72s cold / 3s warm with standard polling |
-| Cost | ~$0.001 per million events sustained; ~$0.16 per live demo-hour with fan-out (~$0.11 polling; the difference is the consumer-hour plus ~2.8 consumer invocations/s instead of 1/s); stream plus fan-out consumer ~$0.03/hour until the daily janitor tears them down, then $0 idle (separate from the hosted deployment's Aurora and public-IPv4 floor noted above) |
+| Live latency, enhanced fan-out (651 trades, AWS clocks on both ends) | p50 167 ms, p90 256 ms, p99 304 ms, max 351 ms |
+| Live latency, standard shard polling | p50 694 ms, p99 991 ms |
+| Per-shard ceiling, one event per record | ~1,386 events/s |
+| Per-shard ceiling, 10-100 events per record | ~10,000 events/s (x7.2) |
+| 100K-event backlog after an outage | drained in 1.5 s (~67K events/s) |
+| "Go live" to first data | 0.6 s warm; ~90 s cold, when the stream, consumer, and mapping are created |
+| Stop to ingest exit | 1.2 s |
+| Cost | ~$0.001 per million events; ~$0.16 per live hour; $0 once the janitor tears down |
 
-## Design notes (Phase 2)
+Latency is measured from ingest to DynamoDB write, the segment this system controls; the exchange-to-ingest leg includes Coinbase's own pipeline and clock skew, so it is reported separately.
 
-- Plaid access tokens are encrypted at rest with AES-256-GCM (`src/lib/crypto.ts`).
-- Transaction sync (`src/lib/plaid/sync.ts`) is idempotent: a DynamoDB conditional-write lock (token-guarded release, TTL takeover) serializes syncs per bank item, each `transactions/sync` page commits together with its cursor in one DB transaction, and upserts are keyed on Plaid's transaction id - so crashes resume cleanly and re-runs are no-ops.
-- `src/proxy.ts` redirects unauthenticated `/dashboard` requests; the dashboard page re-checks the session server-side.
+## Core app: auth and bank sync
 
-## Tests and verification scripts
+- **Authentication.**
+  Auth.js v5 with email and password credentials (bcrypt) and JWT sessions in an httpOnly cookie.
+  `src/proxy.ts` redirects signed-out dashboard requests, and every page and route re-checks the session server-side; registration and login are rate-limited per IP.
+- **Bank data.**
+  Plaid Link in Sandbox mode, then cursor-based `transactions/sync` into Postgres.
+  Plaid access tokens are encrypted at rest with AES-256-GCM ([`src/lib/crypto.ts`](src/lib/crypto.ts)).
+- **Idempotent sync.**
+  A DynamoDB conditional-write lease (token-guarded release, TTL takeover) serializes syncs per bank item, each sync page commits together with its cursor in one database transaction, and upserts key on Plaid's transaction id.
+  A crash resumes from the last committed page, and in production a concurrent second sync was turned away by the lease while a re-sync changed 0 rows.
+  This is deliberately the opposite mechanism from WealthSim: Plaid's side effects are not replayable, so it needs a lock, while simulation chunks are, so they do not.
+- **No Redis.**
+  Rate-limit windows, daily budgets, and sync locks all live in one DynamoDB table using conditional writes, which keeps the hosted stack free of always-on infrastructure.
+- **Database.**
+  Aurora Serverless v2 (Postgres 16) scales to 0 ACU when idle, enforces TLS, and the app pins the RDS certificate authority for full certificate and hostname verification.
+
+## Cost
+
+| Item | Cost |
+|---|---|
+| Simulation and streaming compute while idle | $0 (the idle stream bills ~$0.03/hour until the daily janitor deletes it) |
+| One 100M-path simulation (64 Go workers) | ~$0.035 all-in |
+| One live hour of PortfolioPulse | ~$0.16 |
+| Hosted deployment, measured monthly total | $8.86 (September 2026), $11.35 (October 2026) |
+
+The monthly floor is mostly Aurora, which pauses at 0 ACU but still wakes about every two hours for its own maintenance and bills each wake for the full five-minute auto-pause window, plus the public IPv4 address the database endpoint needs.
+A Route 53 hosted zone adds about $0.50, and a $15 budget alarm guards the account.
+
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| Web app | Next.js 16 (App Router), React 19, TypeScript, Tailwind CSS v4, hosted on Vercel |
+| Auth | Auth.js v5 credentials provider, bcrypt, JWT sessions |
+| Data | PostgreSQL 16 via Prisma 7 (driver adapter) on Aurora Serverless v2; DynamoDB for coordination and streaming state |
+| Bank data | Plaid Link and `transactions/sync` (Sandbox) |
+| Simulation | Node.js 22 and Go 1.26 workers on SQS, S3, Lambda, and AWS Batch on Fargate |
+| Streaming | Coinbase websocket, Kinesis Data Streams with enhanced fan-out, Lambda, EventBridge |
+| Infrastructure | Terraform with a versioned S3 backend and native state locking; ECR; CloudWatch alarms to SNS email |
+| Local stack | Docker Compose with Postgres, ElasticMQ, MinIO, kinesis-mock, and dynamodb-local |
+| CI | GitHub Actions: lint, type check, production build, dependency audit, Go tests, Terraform validation |
+
+## Repository layout
+
+```text
+src/
+  app/                 Next.js pages and API route handlers
+  components/          Dashboard, simulation, and Pulse UI
+  lib/
+    wealthsim/         Kernel, RNG, histograms, chunking, queue and storage clients, aggregation, guards
+    pulse/             Bar merging, session lease, stream and table access
+    plaid/             Plaid client, account and transaction sync
+    app-state.ts       DynamoDB counters and leases behind rate limits, budgets, and sync locks
+  workers/
+    wealthsim/         Node.js queue worker and Lambda handler
+    pulse/             Ingest, consumer, and janitor Lambdas
+go-worker/             Go engine: RNG, kernel, queue worker, Lambda handler, benchmark
+infra/                 Terraform for every AWS resource
+prisma/                Database schema and migrations
+scripts/               Benchmarks, chaos tests, parity and variance studies, Lambda bundling
+bench-results/         Raw benchmark data (JSON Lines)
+docker/                App and worker images, ElasticMQ config
+```
+
+## Getting started
+
+Prerequisites: Node.js 22, pnpm 10, Docker, and a free [Plaid dashboard](https://dashboard.plaid.com) account for Sandbox keys.
+Go 1.26 is only needed to work on the Go engine outside Docker.
 
 ```bash
-pnpm test                                    # vitest (local-only): kernel determinism, GBM closed forms,
-                                             # histogram accuracy, merge exactness, variance reduction
-pnpm bench                                   # local Node throughput baseline
-(cd go-worker && go test ./... && go run ./cmd/bench)  # Go suite (RNG bit-parity, golden summaries,
-                                             # closed forms) + Go throughput baseline
-pnpm exec tsx scripts/gen-parity-vectors.ts  # regenerate cross-engine vectors after kernel changes
-pnpm exec tsx scripts/parity-test.ts         # E2E cross-engine parity (needs worker + worker-go up)
-pnpm exec tsx scripts/variance-test.ts       # antithetic vs independent variance study
-pnpm exec tsx scripts/chaos-test.ts          # kill-a-worker idempotency proof (needs 2 workers up;
-                                             # ENGINE=go targets the Go fleet)
+cp .env.example .env
+# Fill in AUTH_SECRET (openssl rand -base64 32), PLAID_TOKEN_ENC_KEY (openssl rand -hex 32),
+# and PLAID_CLIENT_ID / PLAID_SECRET from the Plaid dashboard (Sandbox keys).
+
+pnpm install
+docker compose up -d db queue objectstore stream table   # Postgres, SQS, S3, Kinesis, and DynamoDB emulators
+docker compose up -d worker worker-go                    # both compute engines (scale with --scale worker=4)
+pnpm prisma migrate dev                                  # create the database tables
+pnpm dev                                                 # http://localhost:3000
 ```
+
+Postgres is published on host port 5434 rather than 5432 to avoid clashing with a natively installed Postgres.
+`docker compose up` can also build and run the app itself, but on Docker for Windows file changes do not reach the bind mount, so `pnpm dev` on the host is the primary dev loop.
+Locally, PortfolioPulse runs by hand with `scripts/pulse-ingest-local.ts` and `scripts/pulse-consumer-local.ts`, which can use a synthetic source instead of the live Coinbase feed.
+
+Then, in the browser:
+
+1. Register at `/register`, which signs you in and opens the dashboard.
+2. Click "Connect a bank", pick any institution, and sign in with `user_good` / `pass_good`.
+3. Accounts and transactions sync into Postgres; "Sync" runs an incremental `transactions/sync`.
+4. Open "Simulations", set your assumptions, pick an engine, and run a projection; the fan chart shows the median and percentile bands per year.
+5. Or click "Race both engines": the same seed runs on Node.js and Go side by side, and a badge reports the measured divergence between the two results.
+
+## Testing and verification
+
+CI runs lint, a type check, a production build, a production dependency audit, the Go test suite, and Terraform format and validation on every push.
+The heavier proofs below run against the local stack or real AWS.
+Scripts run with `pnpm exec tsx scripts/<name>.ts`.
+
+| Command or script | What it proves |
+|---|---|
+| `pnpm test` | Vitest suite (run locally): kernel determinism, GBM closed forms, histogram accuracy, merge exactness, variance reduction, bar merging |
+| `go test ./...` in `go-worker/` | Go RNG streams are bit-exact against vectors generated from the Node.js kernel; golden summaries and closed forms |
+| `pnpm bench`, `go run ./cmd/bench` | Local single-machine kernel throughput for each engine |
+| `parity-test.ts` | Same seed through the full pipeline on both engines: Go reruns are byte-identical, cross-engine divergence stays within tolerance |
+| `chaos-test.ts` | Kill a worker mid-job, wait for redelivery, and assert byte-identical results against a control run (`ENGINE=go` for the Go fleet) |
+| `chaos-test-aws.ts` | The same proof with real Fargate task termination |
+| `variance-test.ts` | Antithetic vs independent sampling, per estimator |
+| `bench-aws.ts` | Fargate scaling curve (`ENGINE`, `WORKERS`, `PATHS_LIST`, `REPEATS`) |
+| `bench-pulse.ts` | Pulse throughput, latency, and backlog-drain benchmarks against the live stream |
+
+After changing the kernel, regenerate the cross-engine vectors with `gen-parity-vectors.ts`.
+
+## Deploying to AWS
+
+Terraform in [`infra/`](infra) provisions the whole AWS side: public subnets with no NAT gateway, per-engine SQS queues with dead-letter queues, the S3 results bucket with a 30-day lifecycle, ECR repositories, the Batch compute environment and job definitions, the demo and Pulse Lambdas, DynamoDB tables, Aurora, least-privilege IAM, CloudWatch alarms that email on any dead-letter message, and a monthly budget alarm.
+The Kinesis stream and its consumer are deliberately not in Terraform, because the ingest creates them on demand and the janitor deletes them.
+
+```bash
+pnpm build:lambdas                       # bundle the Node.js and Go Lambda zips into dist/lambda/
+cd infra && terraform init && terraform plan -out=tfplan && terraform apply tfplan
+```
+
+The state backend in `infra/terraform.tf` points at this project's own bucket; change it before applying to another account.
+To run Batch benchmark fleets, build `docker/Dockerfile.worker` and `docker/Dockerfile.worker-go` for `linux/amd64`, push them to the ECR repositories from the Terraform outputs, and drive jobs with `scripts/run-aws-job.ts` or `scripts/bench-aws.ts`.
+The hosted app needs the same environment as `.env.example`, minus the `*_ENDPOINT` overrides, pointed at the Terraform outputs.
+
+## Roadmap
+
+- **Push Pulse updates to the browser.**
+  The pipeline is at 167 ms p50, but the tile still polls every 1.5 s; server-sent events or WebSockets would make glass-to-glass latency the headline number.
+- **Goal planning on WealthSim.**
+  Answer "Will I reach $X by year Y?" with contributions and withdrawals over time, inflation-adjusted output, and sequence-of-returns risk.
+- **Faster large-job finalization.**
+  Streaming, bounded-concurrency aggregation would remove the S3 GET queue behind 100M-path jobs.
+- **Cost guardrails in CI.**
+  Infracost on Terraform changes, and OIDC-based deploys instead of applying from a laptop.
+- **Real bank accounts.**
+  In order: KMS envelope encryption for Plaid tokens, Plaid production access, webhook-driven sync with signature verification, and a data deletion path.
