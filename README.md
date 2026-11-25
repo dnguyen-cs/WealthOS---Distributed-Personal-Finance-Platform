@@ -59,36 +59,39 @@ The app runs on Vercel and talks to AWS through a least-privilege IAM user.
 Everything on the AWS side is defined in [`infra/`](infra), except the Kinesis stream, which the ingest creates on demand.
 
 ```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 200}}}%%
 flowchart TB
     browser([Browser]) --> app["Next.js 16 app on Vercel<br/>pages + API routes"]
 
     subgraph core [Core app]
+        direction TB
         plaid[Plaid Sandbox API]
         aurora[("Aurora Serverless v2<br/>Postgres, min 0 ACU")]
         appstate[("DynamoDB app-state<br/>rate limits, budgets, locks")]
+        plaid ~~~ aurora ~~~ appstate
     end
 
     subgraph sim [WealthSim]
+        direction TB
         queues["SQS<br/>one queue per engine"]
         workers["Stateless workers<br/>Lambda or Fargate<br/>Node.js and Go"]
         s3[("S3 chunk summaries")]
+        queues --> workers --> s3
     end
 
     subgraph pulse [PortfolioPulse]
+        direction TB
         coinbase[Coinbase websocket]
         ingest[pulse-ingest Lambda]
         kinesis[Kinesis stream]
         consumer[pulse-consumer Lambda]
         pulsetable[(DynamoDB pulse table)]
+        coinbase --> ingest --> kinesis --> consumer --> pulsetable
     end
 
-    app --> plaid
-    app --> aurora
-    app --> appstate
-    plaid ~~~ aurora ~~~ appstate
-    app -- "enqueue chunks" --> queues --> workers --> s3
-    app -- "Go live" --> ingest
-    coinbase --> ingest --> kinesis --> consumer --> pulsetable
+    app -- "Plaid sync, SQL, locks" --> core
+    app -- "enqueue chunks" --> sim
+    app -- "Go live" --> pulse
 ```
 
 The app also reads back from both compute modules: it aggregates chunk summaries from S3 when a simulation finishes, and the market tile polls the Pulse table.
@@ -273,6 +276,7 @@ PortfolioPulse streams live trades for BTC-USD, ETH-USD, and SOL-USD from Coinba
 The one component a streaming pipeline normally cannot scale to zero is the process holding the websocket, so it runs as an on-demand Lambda session instead of a server.
 
 ```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 200}}}%%
 flowchart TB
     subgraph produce [Ingest]
         direction LR
